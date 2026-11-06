@@ -1,0 +1,19 @@
+[resolver]
+incompatible-rust-versions = "fallback"
+
+# whisper.cpp build switches, read by whisper-rs-sys. Never -march=native: the
+# released binary must run on every x86_64 machine it is installed on. This is
+# the "x86-64-v3" engine (AVX2, FMA, F16C, BMI2); release.yml also builds a
+# baseline engine (SSE4.2 only) by overriding these in the environment, and
+# nirudictate picks the one this CPU can run at start-up.
+[env]
+WHISPER_DONT_GENERATE_BINDINGS = "1"
+GGML_NATIVE = "OFF"
+GGML_SSE42 = "ON"
+GGML_AVX = "ON"
+GGML_AVX2 = "ON"
+GGML_FMA = "ON"
+GGML_F16C = "ON"
+GGML_BMI2 = "ON"
+GGML_AVX512 = "OFF"
+GGML_OPENMP = "OFF"

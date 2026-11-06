@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  SYSTEM_DEPS: >-
+    cmake libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libxcb1-dev
+    libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: System build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y $SYSTEM_DEPS
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+      - name: Shell scripts
+        run: bash -n install.sh uninstall.sh && shellcheck -S warning install.sh uninstall.sh
+
+  msrv:
+    # whisper-rs needs Rust 1.88; the lockfile must build unchanged on it.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: System build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y $SYSTEM_DEPS
+      - name: Tests on the declared rust-version
+        run: cargo test --locked

@@ -1,0 +1,80 @@
+name: release
+
+# A pushed tag vX.Y.Z builds the prebuilt x86_64 binaries that install.sh
+# downloads and publishes them with their SHA256SUMS file. Ubuntu 22.04 has
+# glibc 2.35, so the binaries run on Debian 12+, Arch and Void.
+#
+# Two engines are built from the same source: the default one uses AVX2/FMA
+# (x86-64-v3), `nirudictate-baseline` only SSE4.2 for older CPUs. Neither uses
+# -march=native; the default binary starts the baseline one on a CPU without
+# AVX2.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - name: System build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libxkbcommon-dev libxkbcommon-x11-dev libx11-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then test "v$version" = "$GITHUB_REF_NAME"; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Test
+        run: cargo test --locked
+      - name: Build (x86-64-v3 engine)
+        run: cargo build --release --locked
+      - name: Build (baseline engine)
+        env:
+          GGML_AVX: "OFF"
+          GGML_AVX2: "OFF"
+          GGML_FMA: "OFF"
+          GGML_F16C: "OFF"
+          GGML_BMI2: "OFF"
+          NIRUDICTATE_ENGINE: baseline
+        run: cargo build --release --locked --target-dir target-baseline
+      - name: Package
+        run: |
+          mkdir -p dist/pkg
+          install -m 0755 target/release/nirudictate dist/pkg/nirudictate
+          install -m 0755 target-baseline/release/nirudictate dist/pkg/nirudictate-baseline
+          ./dist/pkg/nirudictate --version | grep -qx "NIRUDICTATE $VERSION"
+          NIRUDICTATE_NO_REEXEC=1 ./dist/pkg/nirudictate-baseline --version | grep -qx "NIRUDICTATE $VERSION"
+          # The baseline engine must have been configured without AVX.
+          grep -q '^GGML_AVX2:BOOL=OFF' target-baseline/release/build/whisper-rs-sys-*/out/build/CMakeCache.txt
+          grep -q '^GGML_AVX2:BOOL=ON' target/release/build/whisper-rs-sys-*/out/build/CMakeCache.txt
+          for b in nirudictate nirudictate-baseline; do
+            objdump -T "dist/pkg/$b" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          done
+          tar --owner=0 --group=0 --numeric-owner -C dist/pkg \
+            -czf "dist/nirudictate-$VERSION-x86_64-linux-gnu.tar.gz" nirudictate nirudictate-baseline
+          (cd dist && sha256sum "nirudictate-$VERSION-x86_64-linux-gnu.tar.gz" > "SHA256SUMS-$VERSION")
+          cat "dist/SHA256SUMS-$VERSION"
+      - name: Keep the dry-run package
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nirudictate-dry-run
+          path: dist/*
+      - name: Publish
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="$(awk -v h="# NIRUDICTATE $VERSION" '$0==h{f=1;next} /^# NIRUDICTATE /{f=0} f' CHANGELOG.md)"
+          gh release create "$GITHUB_REF_NAME" --title "NIRUDICTATE $VERSION" --notes "$notes" \
+            "dist/nirudictate-$VERSION-x86_64-linux-gnu.tar.gz" "dist/SHA256SUMS-$VERSION"

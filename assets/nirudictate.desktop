@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=NIRUDICTATE
+GenericName=Dictation
+Comment=Local speech-to-text: speak and the text appears where you type
+Exec=nirudictate settings
+Icon=nirudictate
+Terminal=false
+Categories=Utility;Accessibility;AudioVideo;
+Keywords=dictation;speech;voice;transcribe;whisper;tal;diktering;
+StartupNotify=true
+StartupWMClass=nirudictate

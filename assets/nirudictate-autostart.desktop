@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=NIRUDICTATE service
+Comment=Listens for the dictation shortcut
+Exec=nirudictate autostart
+Icon=nirudictate
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

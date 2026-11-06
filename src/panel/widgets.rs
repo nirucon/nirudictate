@@ -111,7 +111,7 @@ pub fn segment(ui: &mut Ui, p: &Palette, text: &str, selected: bool) -> Response
     )
 }
 
-pub fn nav_item(ui: &mut Ui, p: &Palette, icon: &str, text: &str, selected: bool) -> Response {
+pub fn nav_item(ui: &mut Ui, p: &Palette, text: &str, selected: bool) -> Response {
     let height = 34.0;
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
@@ -136,14 +136,7 @@ pub fn nav_item(ui: &mut Ui, p: &Palette, icon: &str, text: &str, selected: bool
         mix(p.muted, p.foreground, 0.3)
     };
     painter.text(
-        rect.left_center() + egui::vec2(14.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        icon,
-        egui::FontId::proportional(14.0),
-        if selected { p.accent } else { p.muted },
-    );
-    painter.text(
-        rect.left_center() + egui::vec2(40.0, 0.0),
+        rect.left_center() + egui::vec2(16.0, 0.0),
         egui::Align2::LEFT_CENTER,
         text,
         egui::FontId::proportional(14.5),

@@ -190,6 +190,8 @@ struct Worker {
     served: (bool, bool),
     focus_base: Option<u32>,
     resource_mask: u32,
+    /// The selection the paste in progress reads.
+    pasting: Option<Atom>,
 }
 
 impl Worker {
@@ -236,6 +238,7 @@ impl Worker {
             served: (false, false),
             focus_base: None,
             resource_mask,
+            pasting: None,
         })
     }
 
@@ -354,7 +357,7 @@ impl Worker {
                                 )
                                 .is_ok();
                         }
-                        if ok && e.selection == self.wanted_selection() {
+                        if ok && Some(e.selection) == self.pasting {
                             self.served.0 = true;
                             if self.focus_base == Some(e.requestor & !self.resource_mask) {
                                 self.served.1 = true;
@@ -400,17 +403,6 @@ impl Worker {
             .conn
             .send_event(false, e.requestor, EventMask::NO_EVENT, notify);
         let _ = self.conn.flush();
-    }
-
-    /// The selection the current paste reads (set during an insert).
-    fn wanted_selection(&self) -> Atom {
-        if self.offers.contains_key(&self.atoms.primary)
-            && !self.offers.contains_key(&self.atoms.clipboard)
-        {
-            self.atoms.primary
-        } else {
-            self.atoms.clipboard
-        }
     }
 
     /// Wait for one event matching `pred` (other events are handled normally).
@@ -632,7 +624,37 @@ impl Worker {
         (Some(win), classes)
     }
 
+    /// Another client holds the keyboard (a locked screen, an open menu):
+    /// synthetic keys would go to it, so nothing is inserted.
+    fn keyboard_taken(&self) -> bool {
+        use x11rb::protocol::xproto::{GrabMode, GrabStatus};
+        let status = self
+            .conn
+            .grab_keyboard(
+                false,
+                self.root,
+                x11rb::CURRENT_TIME,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| r.status);
+        match status {
+            Some(GrabStatus::SUCCESS) => {
+                let _ = self.conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+                let _ = self.conn.flush();
+                false
+            }
+            Some(GrabStatus::ALREADY_GRABBED) | Some(GrabStatus::FROZEN) => true,
+            _ => false,
+        }
+    }
+
     fn insert(&mut self, job: &Insert) -> Result<String, String> {
+        if self.keyboard_taken() {
+            return Err("the keyboard is held by another program (locked screen or open menu); nothing was inserted".into());
+        }
         let (focus, classes) = self.focused_classes();
         self.focus_base = focus.map(|w| w & !self.resource_mask);
         let mut keys = Keyboard::load(&self.conn)?;
@@ -653,7 +675,9 @@ impl Worker {
             None
         };
         self.served = (false, false);
+        self.pasting = Some(selection);
         if !self.own(selection, Offer::Text(job.text.clone())) {
+            self.pasting = None;
             if job.type_fallback {
                 keys.type_text(&self.conn, &job.text)?;
                 return Ok("typed (the clipboard could not be taken)".into());
@@ -681,6 +705,7 @@ impl Worker {
         // Only a request from the focused client proves the paste: clipboard
         // managers poll the clipboard too.
         let pasted = self.served.1;
+        self.pasting = None;
         // Give the old clipboard back (or clear it if there was none).
         if job.restore {
             match previous {

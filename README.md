@@ -37,8 +37,9 @@ nirux extras install nirudictate
 
 NIRUX downloads the pinned, checksum-verified release, installs it in
 `~/.local`, starts the service in your running session and keeps it updated
-with `nirux extras update`. The NIRUX session starts the service at every
-login; nothing in NIRUWM changes.
+with `nirux extras update`. The NIRUX session (NIRUWM 0.17.2 or newer) starts
+the service at every login on Debian, Arch and Void alike, without systemd
+user units; the shortcut needs no window-manager binding.
 
 ### Standalone
 
@@ -316,9 +317,10 @@ Start with `nirudictate doctor`.
 - **Transcription is slow.** Use a smaller model (the panel shows the measured
   time), or set Advanced → Threads higher. Laptops on battery are slower.
 - **Wrong words for names.** Add them under Vocabulary.
-- **Logs.** The service writes to `~/.local/state/nirudictate/daemon.log`
-  when started by the panel or the installer, and to the NIRUWM session log
-  (`~/.local/state/niruwm/session.log`) when started by the session.
+- **Logs.** The service logs each dictation (model, time, how the text was
+  inserted; never the text) to `~/.local/state/niruwm/nirudictate.log` when
+  the NIRUX session started it, and to `~/.local/state/nirudictate/daemon.log`
+  when the panel or the installer did.
 
 ## Uninstall
 

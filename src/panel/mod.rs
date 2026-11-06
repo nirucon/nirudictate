@@ -32,14 +32,14 @@ enum Tab {
     Advanced,
 }
 
-const TABS: &[(Tab, &str, &str)] = &[
-    (Tab::Overview, "Overview", "●"),
-    (Tab::Models, "Languages & Models", "◆"),
-    (Tab::Shortcut, "Shortcut & Mode", "⌨"),
-    (Tab::Output, "Output", "↵"),
-    (Tab::Vocabulary, "Vocabulary", "Aa"),
-    (Tab::History, "History", "≡"),
-    (Tab::Advanced, "Advanced", "⚙"),
+const TABS: &[(Tab, &str)] = &[
+    (Tab::Overview, "Overview"),
+    (Tab::Models, "Languages & Models"),
+    (Tab::Shortcut, "Shortcut & Mode"),
+    (Tab::Output, "Output"),
+    (Tab::Vocabulary, "Vocabulary"),
+    (Tab::History, "History"),
+    (Tab::Advanced, "Advanced"),
 ];
 
 struct Download {
@@ -392,26 +392,41 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
         let p = self.p();
-        egui::SidePanel::left("nav")
-            .exact_width(212.0)
-            .resizable(false)
-            .frame(
-                egui::Frame::none()
-                    .fill(p.panel)
-                    .inner_margin(egui::Margin::symmetric(14.0, 18.0)),
-            )
-            .show(ctx, |ui| self.nav(ui));
+        // A tiling window manager may give the panel a narrow column: the
+        // navigation then moves to a wrapped tab row at the top.
+        let narrow = ctx.screen_rect().width() < 780.0;
+        if narrow {
+            egui::TopBottomPanel::top("tabs")
+                .frame(
+                    egui::Frame::none()
+                        .fill(p.panel)
+                        .inner_margin(egui::Margin::symmetric(12.0, 10.0)),
+                )
+                .show(ctx, |ui| self.tab_row(ui));
+        } else {
+            egui::SidePanel::left("nav")
+                .exact_width(212.0)
+                .resizable(false)
+                .frame(
+                    egui::Frame::none()
+                        .fill(p.panel)
+                        .inner_margin(egui::Margin::symmetric(14.0, 18.0)),
+                )
+                .show(ctx, |ui| self.nav(ui));
+        }
+        let margin = if narrow {
+            egui::Margin::symmetric(12.0, 12.0)
+        } else {
+            egui::Margin::symmetric(28.0, 22.0)
+        };
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(p.background)
-                    .inner_margin(egui::Margin::symmetric(28.0, 22.0)),
-            )
+            .frame(egui::Frame::none().fill(p.background).inner_margin(margin))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.set_max_width(760.0);
+                        let width = ui.available_width().min(760.0);
+                        ui.set_width(width);
                         match self.tab {
                             Tab::Overview => self.overview(ui, ctx),
                             Tab::Models => self.models_tab(ui, ctx),
@@ -452,26 +467,11 @@ impl App {
             });
         });
         ui.add_space(14.0);
-        let status = self.status();
-        let (label, color) = match status.as_ref().map(|s| s.state.as_str()) {
-            Some("recording") => ("Recording", widgets::red(&p)),
-            Some("transcribing") => ("Transcribing", p.warning),
-            Some(_) => ("Ready", p.success),
-            None => ("Service stopped", p.error),
-        };
-        chip(ui, &p, label, color);
+        self.status_chip(ui);
         ui.add_space(18.0);
-        for (tab, label, icon) in TABS {
-            if widgets::nav_item(ui, &p, icon, label, self.tab == *tab).clicked() {
-                self.tab = *tab;
-                self.capturing_shortcut = false;
-                if *tab == Tab::History {
-                    self.history = history::load();
-                }
-                if *tab == Tab::Advanced {
-                    self.devices = audio::devices();
-                    self.themes = theme::available_themes();
-                }
+        for (tab, label) in TABS {
+            if widgets::nav_item(ui, &p, label, self.tab == *tab).clicked() {
+                self.select(*tab);
             }
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
@@ -488,6 +488,47 @@ impl App {
                     .size(11.0)
                     .color(p.disabled),
             );
+        });
+    }
+
+    fn select(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.capturing_shortcut = false;
+        if tab == Tab::History {
+            self.history = history::load();
+        }
+        if tab == Tab::Advanced {
+            self.devices = audio::devices();
+            self.themes = theme::available_themes();
+        }
+    }
+
+    fn status_chip(&self, ui: &mut egui::Ui) {
+        let p = self.p();
+        let (label, color) = match self.status().as_ref().map(|s| s.state.as_str()) {
+            Some("recording") => ("Recording", widgets::red(&p)),
+            Some("transcribing") => ("Transcribing", p.warning),
+            Some(_) => ("Ready", p.success),
+            None => ("Service stopped", p.error),
+        };
+        chip(ui, &p, label, color);
+    }
+
+    /// Navigation for a narrow window.
+    fn tab_row(&mut self, ui: &mut egui::Ui) {
+        let p = self.p();
+        ui.horizontal(|ui| {
+            widgets::logo(ui, &p, 22.0);
+            ui.label(RichText::new("NIRUDICTATE").strong().color(p.foreground));
+            self.status_chip(ui);
+        });
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            for (tab, label) in TABS {
+                if widgets::segment(ui, &p, label, self.tab == *tab).clicked() {
+                    self.select(*tab);
+                }
+            }
         });
     }
 
@@ -546,77 +587,74 @@ impl App {
         let lang = self.cfg.general.language.clone();
         let active = models::active(&lang, self.cfg.model_for(&lang), &self.hw);
         card(ui, &p, |ui| {
+            let (big, color, detail) = match status.as_ref() {
+                None => (
+                    "Service not running",
+                    p.error,
+                    "The shortcut does nothing until the service runs.".to_string(),
+                ),
+                Some(s) if s.state == "recording" => (
+                    "Listening…",
+                    widgets::red(&p),
+                    format!("{:.0} s", s.recording_seconds),
+                ),
+                Some(s) if s.state == "transcribing" => (
+                    "Transcribing…",
+                    p.warning,
+                    "Writing down what you said".into(),
+                ),
+                Some(s) if !s.shortcut_active => (
+                    "Shortcut unavailable",
+                    p.warning,
+                    s.error.clone().unwrap_or_default(),
+                ),
+                Some(_) if active.is_none() => (
+                    "Needs a model",
+                    p.warning,
+                    "Download one below to start dictating.".into(),
+                ),
+                Some(_) => (
+                    "Ready",
+                    p.success,
+                    format!("Press {} anywhere", hotkey::display(&self.cfg.shortcut.key)),
+                ),
+            };
             ui.horizontal(|ui| {
-                let (big, color, detail) = match status.as_ref() {
-                    None => (
-                        "Service not running",
-                        p.error,
-                        "The shortcut does nothing until the service runs.".to_string(),
-                    ),
-                    Some(s) if s.state == "recording" => (
-                        "Listening…",
-                        widgets::red(&p),
-                        format!("{:.0} s", s.recording_seconds),
-                    ),
-                    Some(s) if s.state == "transcribing" => (
-                        "Transcribing…",
-                        p.warning,
-                        "Writing down what you said".into(),
-                    ),
-                    Some(s) if !s.shortcut_active => (
-                        "Shortcut unavailable",
-                        p.warning,
-                        s.error.clone().unwrap_or_default(),
-                    ),
-                    Some(_) if active.is_none() => (
-                        "Needs a model",
-                        p.warning,
-                        "Download one below to start dictating.".into(),
-                    ),
-                    Some(_) => (
-                        "Ready",
-                        p.success,
-                        format!("Press {} anywhere", hotkey::display(&self.cfg.shortcut.key)),
-                    ),
-                };
                 widgets::status_dot(ui, color, 14.0);
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(big).size(20.0).strong().color(p.foreground));
-                    ui.label(RichText::new(detail).color(p.muted));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if status.is_none() {
-                        if widgets::primary_button(ui, &p, "Start service").clicked() {
-                            match start_service() {
-                                Ok(()) => self.toast("Starting the service…", false),
-                                Err(e) => self.toast(e, true),
-                            }
+                ui.label(RichText::new(big).size(20.0).strong().color(p.foreground));
+            });
+            ui.label(RichText::new(detail).color(p.muted));
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if status.is_none() {
+                    if widgets::primary_button(ui, &p, "Start service").clicked() {
+                        match start_service() {
+                            Ok(()) => self.toast("Starting the service…", false),
+                            Err(e) => self.toast(e, true),
                         }
-                    } else if status.as_ref().is_some_and(|s| s.state == "recording") {
-                        if ui.button("Stop").clicked() {
-                            let _ = ipc::send(&Request::Stop, Duration::from_secs(2));
-                        }
-                    } else if active.is_some()
-                        && ui
-                            .button("Dictate now")
-                            .on_hover_text(
-                                "Starts recording; the text goes to the window that has focus",
-                            )
-                            .clicked()
-                    {
-                        let _ = ipc::send(&Request::Start, Duration::from_secs(2));
                     }
-                });
+                } else if status.as_ref().is_some_and(|s| s.state == "recording") {
+                    if ui.button("Stop").clicked() {
+                        let _ = ipc::send(&Request::Stop, Duration::from_secs(2));
+                    }
+                } else if active.is_some()
+                    && ui
+                        .button("Dictate now")
+                        .on_hover_text(
+                            "Starts recording; the text goes to the window that has focus",
+                        )
+                        .clicked()
+                {
+                    let _ = ipc::send(&Request::Start, Duration::from_secs(2));
+                }
             });
             ui.add_space(10.0);
             ui.separator();
             ui.add_space(6.0);
-            egui::Grid::new("ov-grid")
-                .num_columns(2)
-                .spacing([24.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label(RichText::new("Language").color(p.muted));
-                    ui.horizontal(|ui| {
+            {
+                {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Language").color(p.muted));
                         for (code, label) in config::LANGUAGES {
                             if widgets::segment(ui, &p, label, self.cfg.general.language == *code)
                                 .clicked()
@@ -625,24 +663,24 @@ impl App {
                             }
                         }
                     });
-                    ui.end_row();
-                    ui.label(RichText::new("Model").color(p.muted));
-                    ui.label(match active {
-                        Some(m) => format!(
-                            "{} · {}{}",
-                            m.label,
-                            models::human_size(m.bytes),
-                            if status.as_ref().and_then(|s| s.loaded.as_deref()) == Some(m.id) {
-                                " · loaded"
-                            } else {
-                                ""
-                            }
-                        ),
-                        None => "none installed".into(),
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Model").color(p.muted));
+                        ui.label(match active {
+                            Some(m) => format!(
+                                "{} · {}{}",
+                                m.label,
+                                models::human_size(m.bytes),
+                                if status.as_ref().and_then(|s| s.loaded.as_deref()) == Some(m.id) {
+                                    " · loaded"
+                                } else {
+                                    ""
+                                }
+                            ),
+                            None => "none installed".into(),
+                        });
                     });
-                    ui.end_row();
-                    ui.label(RichText::new("Shortcut").color(p.muted));
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Shortcut").color(p.muted));
                         widgets::keycaps(ui, &p, &self.cfg.shortcut.key);
                         ui.label(
                             RichText::new(match self.cfg.shortcut.mode {
@@ -653,8 +691,8 @@ impl App {
                             .color(p.muted),
                         );
                     });
-                    ui.end_row();
-                });
+                }
+            }
         });
         if active.is_none() {
             let rec = models::recommend(&lang, &self.hw, self.measured);
@@ -745,7 +783,7 @@ impl App {
         if let Some(last) = status.as_ref().and_then(|s| s.last.clone()) {
             ui.add_space(12.0);
             card(ui, &p, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     section_title(ui, &p, "Last dictation");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Copy").clicked() {
@@ -794,7 +832,7 @@ impl App {
                     pr.bytes_per_second / 1e6
                 )
             };
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.add(
                     egui::ProgressBar::new(frac)
                         .desired_width(if big { 320.0 } else { 200.0 })
@@ -826,7 +864,7 @@ impl App {
             "Models are downloaded once, verified, and run on this computer only.",
         );
         card(ui, &p, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Dictation language").color(p.muted));
                 for (code, label) in config::LANGUAGES {
                     if widgets::segment(ui, &p, label, self.cfg.general.language == *code).clicked()
@@ -857,7 +895,7 @@ impl App {
             ui.add_space(14.0);
             let rec = models::recommend(code, &self.hw, self.measured);
             let active = models::active(code, self.cfg.model_for(code), &self.hw);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 section_title(ui, &p, label);
                 ui.label(
                     RichText::new(match *code {
@@ -871,11 +909,10 @@ impl App {
             card(ui, &p, |ui| {
                 for m in models::for_language(code) {
                     let installed = m.installed();
-                    ui.horizontal(|ui| {
-                        let is_active = active.map(|a| a.id) == Some(m.id);
-                        ui.vertical(|ui| {
-                            ui.set_width(300.0);
-                            ui.horizontal(|ui| {
+                    let is_active = active.map(|a| a.id) == Some(m.id);
+                    {
+                        {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new(m.label).strong().color(p.foreground));
                                 if m.id == rec.id {
                                     chip(ui, &p, "Recommended", p.accent);
@@ -894,8 +931,8 @@ impl App {
                                 .size(12.0)
                                 .color(p.muted),
                             );
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        }
+                        ui.horizontal_wrapped(|ui| {
                             if installed {
                                 if self.confirm_delete == Some(m.id) {
                                     if ui.button(RichText::new("Delete").color(p.error)).clicked() {
@@ -918,21 +955,23 @@ impl App {
                                         self.confirm_delete = None;
                                     }
                                 } else {
-                                    if ui.small_button("Delete…").clicked() {
-                                        self.confirm_delete = Some(m.id);
-                                    }
                                     if !is_active && ui.button("Use").clicked() {
                                         self.cfg.set_model_for(code, m.id);
+                                    }
+                                    if ui.small_button("Delete…").clicked() {
+                                        self.confirm_delete = Some(m.id);
                                     }
                                 }
                             } else {
                                 self.download_row(ui, ctx, m, false);
                             }
                         });
-                    });
-                    ui.add_space(6.0);
+                    }
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Automatic choice:").size(12.0).color(p.muted));
                     let auto = self.cfg.model_for(code).is_empty();
                     if ui
@@ -966,7 +1005,7 @@ impl App {
         );
         card(ui, &p, |ui| {
             section_title(ui, &p, "Shortcut");
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if self.capturing_shortcut {
                     ui.label(
                         RichText::new("Press the new combination… (Esc cancels)").color(p.accent),
@@ -1033,7 +1072,7 @@ impl App {
                     }
                     if self.cfg.shortcut.mode != Mode::Hold {
                         ui.label("Stop after silence");
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             let mut on = self.cfg.shortcut.silence_seconds > 0.0;
                             if ui.checkbox(&mut on, "").changed() {
                                 self.cfg.shortcut.silence_seconds = if on { 2.0 } else { 0.0 };
@@ -1119,7 +1158,7 @@ impl App {
                 .size(12.0)
                 .color(p.muted),
             );
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Also treat as terminals (WM_CLASS):");
                 if ui
                     .add(
@@ -1221,7 +1260,7 @@ impl App {
             "Kept only on this computer, readable only by you. Audio is never stored.",
         );
         card(ui, &p, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.checkbox(&mut self.cfg.history.enabled, "Keep a history");
                 if self.cfg.history.enabled {
                     ui.label("· keep the last");
@@ -1269,7 +1308,7 @@ impl App {
         let mut delete = None;
         for e in self.history.iter().rev().take(300) {
             card(ui, &p, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(widgets::when(e.time))
                             .size(12.0)
@@ -1359,7 +1398,7 @@ impl App {
                 .spacing([18.0, 10.0])
                 .show(ui, |ui| {
                     ui.label("Threads");
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let auto = hardware::threads_for(&self.hw);
                         let mut is_auto = self.cfg.advanced.threads == 0;
                         if ui
@@ -1377,10 +1416,10 @@ impl App {
                     });
                     ui.end_row();
                     ui.label("Priority");
-                    ui.add(
-                        egui::Slider::new(&mut self.cfg.advanced.nice, 0..=19)
-                            .text("nice (higher yields to other apps)"),
-                    );
+                    ui.add(egui::Slider::new(&mut self.cfg.advanced.nice, 0..=19).text("nice"))
+                        .on_hover_text(
+                            "Higher values let music, visualizers and the desktop go first",
+                        );
                     ui.end_row();
                     ui.label("Model memory");
                     ui.vertical(|ui| {
@@ -1389,7 +1428,7 @@ impl App {
                             "Keep the model loaded (faster first dictation)",
                         );
                         if !self.cfg.advanced.keep_model_loaded {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Unload after");
                                 ui.add(
                                     egui::DragValue::new(
@@ -1455,7 +1494,7 @@ impl App {
                     ui.label(RichText::new("Not running").color(p.error));
                 }
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if status.is_some() {
                     if ui.button("Restart service").clicked() {
                         let _ = ipc::send(&Request::Quit, Duration::from_secs(2));
@@ -1487,7 +1526,7 @@ impl App {
                 ("History", config::history_path()),
                 ("Service log", config::log_path()),
             ] {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(what).color(p.muted));
                     ui.label(
                         RichText::new(path.display().to_string())
@@ -1551,7 +1590,16 @@ fn raise_existing() -> bool {
     false
 }
 
-pub fn run() -> Result<(), String> {
+pub fn run(tab: Option<&str>) -> Result<(), String> {
+    let start_tab = match tab.unwrap_or("overview") {
+        "models" | "languages" => Tab::Models,
+        "shortcut" | "mode" => Tab::Shortcut,
+        "output" => Tab::Output,
+        "vocabulary" => Tab::Vocabulary,
+        "history" => Tab::History,
+        "advanced" => Tab::Advanced,
+        _ => Tab::Overview,
+    };
     let lock_dir = config::runtime_dir();
     config::ensure_private_dir(&lock_dir)?;
     let lock = std::fs::OpenOptions::new()
@@ -1584,6 +1632,7 @@ pub fn run() -> Result<(), String> {
         Box::new(|cc| {
             let mut app = App::new(cc);
             app.restyle_pending = true;
+            app.tab = start_tab;
             Ok(Box::new(app))
         }),
     )

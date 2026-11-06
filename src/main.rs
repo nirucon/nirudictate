@@ -67,7 +67,8 @@ NIRUDICTATE — local speech-to-text dictation
 
 Usage: nirudictate [COMMAND]
 
-  settings                 open the control panel (default)
+  settings [TAB]           open the control panel (models, shortcut, output,
+                           vocabulary, history, advanced)
   start | stop | toggle    control a dictation (the shortcut does the same)
   cancel                   stop recording and discard it
   status [--json]          what the service is doing
@@ -102,7 +103,7 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             Ok(())
         }
-        "settings" | "panel" => panel::run(),
+        "settings" | "panel" => panel::run(rest.first().map(String::as_str)),
         "daemon" | "service" => daemon::run(true),
         "autostart" => autostart(),
         "start" => control(Request::Start),

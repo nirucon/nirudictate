@@ -37,7 +37,7 @@ nirux extras install nirudictate
 
 NIRUX downloads the pinned, checksum-verified release, installs it in
 `~/.local`, starts the service in your running session and keeps it updated
-with `nirux extras update`. The NIRUX session (NIRUWM 0.17.2 or newer) starts
+with `nirux extras update`. The NIRUX session (NIRUWM 0.17.3 or newer) starts
 the service at every login on Debian, Arch and Void alike, without systemd
 user units; the shortcut needs no window-manager binding.
 

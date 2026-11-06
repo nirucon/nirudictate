@@ -432,7 +432,7 @@ pub fn estimated_tiny_seconds(hw: &Hardware) -> f32 {
     if hw.avx2 {
         reference
     } else {
-        reference * 2.8
+        reference * 4.2
     }
 }
 

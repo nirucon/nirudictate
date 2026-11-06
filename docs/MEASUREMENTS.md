@@ -104,3 +104,15 @@ From the end of speech (silence detected, or the key released) to the text in
 the window, KB-Whisper Small on othala: 3.0–3.3 s, of which transcription is
 ~3.1 s and pasting 0.1–0.3 s. Loading the model on the first dictation
 (0.1–0.2 s for Small) happens while the user speaks.
+
+## Engines
+
+The released binaries on othala (KB-Whisper Small, the 8.3 s sentence):
+
+| Engine | Time |
+|---|---|
+| `nirudictate` (AVX2/FMA/F16C, x86-64-v3) | 3.41 s |
+| `nirudictate-baseline` (SSE4.2, forced with `NIRUDICTATE_NO_REEXEC=1`) | 14.35 s |
+
+The baseline engine is about 4.2× slower; the recommendation uses that factor
+on CPUs without AVX2, which therefore get Tiny or Base.

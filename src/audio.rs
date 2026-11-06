@@ -169,6 +169,11 @@ pub fn level_db(frame: &[f32]) -> f32 {
     (10.0 * energy.max(1e-9).log10()).max(-90.0)
 }
 
+/// The loudest 20 ms frame, in dBFS.
+pub fn peak_db(samples: &[f32]) -> f32 {
+    samples.chunks(FRAME).map(level_db).fold(-90.0, f32::max)
+}
+
 /// Meter position 0..1 for a dBFS level (-60 dB .. -6 dB).
 pub fn meter(db: f32) -> f32 {
     ((db + 60.0) / 54.0).clamp(0.0, 1.0)

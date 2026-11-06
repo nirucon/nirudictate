@@ -142,6 +142,7 @@ struct Daemon {
     palette: Option<theme::Palette>,
     scale: f32,
     controller: Controller,
+    key_down: bool,
     phase: Phase,
     grabbed: Vec<(u8, u16)>,
     shortcut_error: Option<String>,
@@ -154,6 +155,10 @@ struct Daemon {
     waker: Waker,
     clients: Receiver<Client>,
     started_panel: Option<Instant>,
+}
+
+fn log(line: String) {
+    eprintln!("nirudictate: {line}");
 }
 
 fn intern(conn: &RustConnection, name: &str) -> u32 {
@@ -271,6 +276,7 @@ pub fn run(foreground_message: bool) -> Result<(), String> {
         palette: None,
         scale,
         controller,
+        key_down: false,
         phase: Phase::Idle,
         grabbed: Vec::new(),
         shortcut_error: None,
@@ -517,9 +523,18 @@ impl Daemon {
     }
 
     fn event(&mut self, event: Event) {
+        if std::env::var_os("NIRUDICTATE_DEBUG").is_some() {
+            log(format!("event {event:?} grabbed {:?}", self.grabbed));
+        }
         match event {
             Event::KeyPress(e) => {
+                // A held key repeats its press (detectable auto-repeat sends
+                // no releases in between); only the first press counts.
+                if self.key_down {
+                    return;
+                }
                 if self.matches(e.detail, u16::from(e.state)) {
+                    self.key_down = true;
                     let busy = matches!(
                         self.phase,
                         Phase::Transcribing { .. } | Phase::Inserting { .. }
@@ -532,6 +547,7 @@ impl Daemon {
                 // The release may come with different modifiers (Ctrl let go
                 // first); any release of the grabbed key counts.
                 if self.grabbed.iter().any(|(c, _)| *c == e.detail) {
+                    self.key_down = false;
                     let action = self.controller.release(Instant::now());
                     self.act(action);
                 }
@@ -586,6 +602,11 @@ impl Daemon {
                     levels_seen: 0,
                 };
                 self.cue(Cue::Start);
+                log(format!(
+                    "recording ({}, {})",
+                    model.id,
+                    self.cfg.advanced.microphone_label()
+                ));
                 self.publish();
                 self.draw();
             }
@@ -605,6 +626,11 @@ impl Daemon {
         self.controller.reset();
         let samples = capture.finish();
         self.cue(Cue::Stop);
+        log(format!(
+            "stopped after {:.1} s of audio (peak level {:.0} dBFS)",
+            samples.len() as f32 / audio::RATE as f32,
+            audio::peak_db(&samples)
+        ));
         let Some(speech) = audio::trim_silence(&samples) else {
             self.notice("Nothing heard".into(), false);
             self.publish();
@@ -654,6 +680,7 @@ impl Daemon {
     }
 
     fn notice(&mut self, text: String, error: bool) {
+        log(format!("notice: {text}"));
         if !self.cfg.general.overlay {
             self.hide();
             return;
@@ -833,6 +860,14 @@ impl Daemon {
     }
 
     fn inserted(&mut self, transcript: Transcript, text: String, how: String) {
+        log(format!(
+            "inserted {} characters, {how} ({}: {:.1} s audio, {:.2} s + {:.2} s load)",
+            text.chars().count(),
+            transcript.model,
+            transcript.audio_seconds,
+            transcript.seconds,
+            transcript.load_seconds
+        ));
         let time = history::now();
         if self.cfg.history.enabled {
             let entry = history::Entry {

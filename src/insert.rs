@@ -678,7 +678,9 @@ impl Worker {
                 break;
             }
         }
-        let pasted = self.served.1 || self.served.0;
+        // Only a request from the focused client proves the paste: clipboard
+        // managers poll the clipboard too.
+        let pasted = self.served.1;
         // Give the old clipboard back (or clear it if there was none).
         if job.restore {
             match previous {

@@ -295,6 +295,16 @@ pub struct Advanced {
     pub nice: i32,
 }
 
+impl Advanced {
+    pub fn microphone_label(&self) -> &str {
+        if self.microphone.is_empty() {
+            "default microphone"
+        } else {
+            &self.microphone
+        }
+    }
+}
+
 impl Default for Advanced {
     fn default() -> Self {
         Self {

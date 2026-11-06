@@ -107,7 +107,7 @@ pub const CATALOG: &[Model] = &[
         url: url!(SV, "kb-whisper-large-q8_0.bin"),
         bytes: 1_656_538_283,
         sha256: "339d086f52e4f5752647ce6bf67cc02cebf197703a5ce4cc2f4252b0c47b38d8",
-        cost: 38.0,
+        cost: 36.0,
         memory_mb: 2100,
     },
     Model {
@@ -162,7 +162,7 @@ pub const CATALOG: &[Model] = &[
         url: url!(EN, "ggml-large-v3-turbo-q8_0.bin"),
         bytes: 874_188_075,
         sha256: "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1",
-        cost: 22.0,
+        cost: 32.0,
         memory_mb: 1300,
     },
 ];

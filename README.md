@@ -1,60 +1,78 @@
 # NIRUDICTATE
 
-Local speech-to-text dictation for the [NIRUX](https://github.com/nirucon/nirux)
-desktop. Press **Ctrl+Alt+Space**, speak, and the text appears in the window
-you are typing in — a terminal, a browser, a mail, a chat. Swedish by default,
-English one click away.
+Local speech-to-text dictation: press Ctrl+Alt+Space, speak, and the text appears where you type.
 
-- **Private.** Speech is turned into text on this computer by
+**Status: alpha** · Part of the [NIRUX](https://github.com/nirucon/nirux) suite · [MIT License](LICENSE)
+
+![NIRUDICTATE](docs/screenshots/main.png)
+
+## About
+
+NIRUDICTATE turns speech into text on this computer and inserts it in the window
+you are typing in: a terminal, a browser, a mail, a chat. Swedish by default,
+English one click away. It is an optional NIRUX extra, and it also works on
+other X11 desktops.
+
+- **Private.** Speech is transcribed locally by
   [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Nothing is sent
   anywhere; the network is used only to download a model, once.
-- **Swedish first.** Uses [KB-Whisper](https://huggingface.co/KBLab) from
-  KBLab, the National Library of Sweden's data lab, trained on 50 000 hours of
-  Swedish. English uses OpenAI's Whisper.
+- **Swedish first.** Swedish uses [KB-Whisper](https://huggingface.co/KBLab)
+  from KBLab, the National Library of Sweden's data lab, trained on 50 000 hours
+  of Swedish. English uses OpenAI's Whisper.
 - **Out of the way.** A small overlay at the bottom of the screen while you
-  speak, a red dot in NIRUBAR, nothing else. The background service uses no
+  speak and a red dot in NIRUBAR, nothing else. The background service uses no
   CPU while idle, opens the microphone only while you dictate, and frees the
   model after ten idle minutes.
 
-NIRUDICTATE is an optional NIRUX extra. It needs X11 (NIRUWM or any other X11
-desktop) and an x86_64 computer with Debian 12/13, Arch or Void (glibc 2.35+).
+### How it works
 
-## Contents
+The service waits for the shortcut without any timer. On a press it starts
+`pw-record` for 16 kHz mono audio, shows the overlay and preloads the model.
+When you stop, silence at the ends is trimmed and whisper.cpp transcribes the
+speech on a background thread at low priority (nice 10, SCHED_BATCH, at most
+one thread per physical core), so music, visualizers and the desktop stay
+smooth. The text is cleaned up (known silence hallucinations such as subtitle
+credits are dropped), put on the clipboard, pasted with XTest, and the
+previous clipboard is put back with everything it held. If the window does not
+take the paste, the text is typed instead. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-- [Install](#install) · [First run](#first-run) · [Shortcut and modes](#shortcut-and-modes)
-- [Languages and models](#languages-and-models) · [Model licenses](#model-licenses)
-- [The control panel](#the-control-panel) · [Command line](#command-line)
-- [Configuration](#configuration) · [Privacy](#privacy) · [How it works](#how-it-works)
-- [Troubleshooting](#troubleshooting) · [Uninstall](#uninstall)
+## Features
 
-## Install
+- Global shortcut (default `Ctrl+Alt+Space`) with hybrid, toggle and
+  push-to-talk modes; NIRUDICTATE listens for it itself, so no window-manager
+  binding is needed.
+- Swedish (KB-Whisper) and English (Whisper) models from Tiny to Large, with a
+  per-computer recommendation based on measured speed.
+- Paste or type output, clipboard restored afterwards, terminal-aware paste,
+  capital letter and trailing space.
+- Vocabulary for names and jargon, a local history, microphone test.
+- A control panel that follows the NIRUX theme (and the Omarchy theme outside
+  NIRUX) live.
+- NIRUX integration: NIRUBAR `dictation` module, `dictation` sound category,
+  started by the NIRUX session.
+- Checksum-verified, resumable model downloads.
 
-### As a NIRUX extra (recommended on NIRUX)
+### Privacy
 
-```sh
-nirux extras install nirudictate
-```
+- Audio stays in memory, is transcribed on this computer and is then
+  discarded. It is never written to disk (except the panel's microphone test,
+  which writes a temporary file in your private runtime directory and deletes
+  it at once).
+- The history is a local file, `~/.local/state/nirudictate/history.jsonl`,
+  readable only by you (0600). Turn it off or clear it in the panel.
+- Network access: only the model downloads, from GitHub (Swedish models) and
+  Hugging Face (English models). No telemetry, no update checks.
+- The microphone is opened only while you dictate: the recorder process
+  exists only then, so PipeWire shows NIRUDICTATE as a recording client only
+  while the red dot is on.
 
-NIRUX downloads the pinned, checksum-verified release, installs it in
-`~/.local`, starts the service in your running session and keeps it updated
-with `nirux extras update`. The NIRUX session (NIRUWM 0.17.3 or newer) starts
-the service at every login on Debian, Arch and Void alike, without systemd
-user units; the shortcut needs no window-manager binding.
+## Requirements
 
-### Standalone
-
-```sh
-git clone https://github.com/nirucon/nirudictate
-cd nirudictate
-./install.sh            # prebuilt binary; --source builds with cargo
-```
-
-The installer puts `nirudictate` in `~/.local/bin`, a launcher entry in
-`~/.local/share/applications`, an XDG autostart entry for other desktops
-(GNOME, KDE, Xfce, …) and starts the service. It needs no root.
-
-Audio is recorded with `pw-record` (PipeWire), or `parec`/`arecord` when
-PipeWire is missing:
+- x86_64 with Debian 12/13, Arch or Void (glibc 2.35 or newer).
+- X11 (NIRUWM or any other X11 desktop) with XTest.
+- OpenGL and `libxkbcommon-x11` for the panel (every NIRUX install has them).
+- A recorder: `pw-record` (PipeWire), or `parec`/`arecord` without PipeWire.
 
 | Distribution | Package with the recorder |
 |---|---|
@@ -62,28 +80,51 @@ PipeWire is missing:
 | Arch | `pipewire` (or `libpulse`, `alsa-utils`) |
 | Void | `pipewire` (or `pulseaudio-utils`, `alsa-utils`) |
 
-The panel needs OpenGL and `libxkbcommon-x11`, which every NIRUX install has.
+The release contains two whisper.cpp builds, one for CPUs with AVX2 and FMA
+(most x86_64 computers since 2013–2015) and a baseline one for older CPUs;
+NIRUDICTATE picks the right one when it starts.
 
-A source build needs Rust 1.88 or newer ([rustup](https://rustup.rs); Debian's
-packaged Rust is too old), `cmake` and a C++ compiler.
+## Installation
 
-## First run
+### With NIRUX
+
+```sh
+nirux extras install nirudictate
+nirux extras update            # later, for the extras you selected
+```
+
+NIRUX downloads the pinned, checksum-verified release, installs it in
+`~/.local` and starts the service in your running session. The NIRUX session
+(NIRUWM 0.17.3 or newer) starts the service at every login on Debian, Arch and
+Void alike, without systemd user units.
+
+### Standalone
+
+```sh
+git clone https://github.com/nirucon/nirudictate
+cd nirudictate
+./install.sh            # prebuilt binaries; --source builds with cargo, --no-start skips starting the service
+```
+
+The installer puts `nirudictate` in `~/.local/bin`, a launcher entry in
+`~/.local/share/applications`, an XDG autostart entry for other desktops
+(GNOME, KDE, Xfce, …) and starts the service. It needs no root.
+
+## Usage
+
+### First run
 
 1. Open **NIRUDICTATE** from the launcher (or run `nirudictate settings`).
-2. The Overview shows the recommended Swedish model for this computer.
-   Click **Download** (about 260 MB for *KB-Whisper Small*). The file is
-   checked against its SHA-256 before it is used.
+2. The Overview shows the recommended Swedish model for this computer. Click
+   **Download** (about 260 MB for *KB-Whisper Small*). The file is checked
+   against its SHA-256 before it is used.
 3. Click **Test microphone**, say a sentence and see what comes out.
 4. Put the cursor in any text field, press **Ctrl+Alt+Space**, speak, and
    pause. The text is inserted.
 
-If you press the shortcut before a model is installed, the panel opens by
-itself.
+If you press the shortcut before a model is installed, the panel opens by itself.
 
-## Shortcut and modes
-
-The default shortcut is **Ctrl+Alt+Space** (free in NIRUWM). NIRUDICTATE
-listens for it itself, so it also sees you let go of the keys.
+### Shortcut and modes
 
 | Mode | How it works |
 |---|---|
@@ -96,11 +137,12 @@ and the language; a thin red line marks push-to-talk. While transcribing it
 shows three moving dots. A dictation that hears nothing is discarded
 ("Nothing heard"). The longest dictation is 2 minutes by default.
 
-Change the shortcut, mode, hold time, silence period and maximum length under
-**Shortcut & Mode**. `nirudictate toggle` (or `start`/`stop`) does the same
-from a script or another key binding.
+While recording, the overlay shows a pulsing red dot, a level meter, the time
+and the language; a thin red line marks push-to-talk. While transcribing it
+shows three moving dots. A dictation that hears nothing is discarded
+("Nothing heard"). The longest dictation is 2 minutes by default.
 
-## Languages and models
+### Languages and models
 
 The panel recommends the largest model that is fast enough on this computer
 (about 3.5 s or less per dictation), from its cores, vector instructions and
@@ -141,30 +183,11 @@ Models are stored in `~/.local/share/nirudictate/models/`. Downloads resume
 where they stopped and are verified against the SHA-256 pinned in the source
 code; a file that does not match is deleted.
 
-### Model licenses
+### The control panel
 
-| Models | Origin | License |
-|---|---|---|
-| KB-Whisper (Swedish) | [KBLab, National Library of Sweden](https://huggingface.co/KBLab) | **Apache License 2.0** |
-| Whisper (English, Turbo) | [OpenAI](https://github.com/openai/whisper), converted by [whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) | **MIT** |
-
-The Swedish files are KBLab's own whisper.cpp files (`ggml-model.bin`,
-16-bit) converted to 8-bit with whisper.cpp 1.8.3's `whisper-quantize`; that
-is the only change. They are published, with the Apache-2.0 license text and
-their checksums, as the [`models-sv-1`](https://github.com/nirucon/nirudictate/releases/tag/models-sv-1)
-release of this repository; [docs/MODELS.md](docs/MODELS.md) has the exact
-source commits and checksums. The 8-bit files are about 15 % faster than the
-16-bit ones and 20 % faster than KBLab's 5-bit files at the same accuracy.
-The English files are downloaded from the whisper.cpp model repository on
-Hugging Face, pinned to a commit.
-
-NIRUDICTATE itself is MIT licensed; whisper.cpp is MIT licensed.
-
-## The control panel
-
-`nirudictate settings` opens the panel. It follows the NIRUX theme (and the
-Omarchy theme outside NIRU) and switches with it live. Every change is saved
-at once.
+`nirudictate settings [TAB]` opens the panel (tabs: `overview`, `models`,
+`shortcut`, `output`, `vocabulary`, `history`, `advanced`). Every change is
+saved at once.
 
 - **Overview** — status, the language, the model, the shortcut; a microphone
   test that transcribes without inserting anything; the last dictation.
@@ -179,16 +202,17 @@ at once.
 - **Advanced** — microphone, threads, priority, keeping the model loaded,
   theme, autostart, and the service.
 
-## Command line
+### Command line
 
 ```text
-nirudictate                     open the panel
+nirudictate                     open the panel (same as settings)
+nirudictate settings [TAB]      open the panel on a tab
 nirudictate start|stop|toggle   control a dictation like the shortcut
 nirudictate cancel              stop recording and discard it
 nirudictate status [--json]     what the service is doing
 nirudictate state               idle, recording, transcribing or stopped
 nirudictate language [sv|en|toggle]
-nirudictate models              list models, sizes and what is installed
+nirudictate models [list] [--json]   models, sizes and what is installed
 nirudictate models recommend    the best model for this computer
 nirudictate models install ID   download (sv-tiny … sv-large, en-tiny … en-turbo, recommended)
 nirudictate models delete ID
@@ -196,7 +220,10 @@ nirudictate models verify ID    check a model against its checksum
 nirudictate transcribe FILE.wav [--model ID]
 nirudictate bench FILE.wav [ID…]
 nirudictate doctor              check display, XTest, audio, models, shortcut
+nirudictate reload              re-read config.toml
+nirudictate unload              free the loaded model now
 nirudictate daemon              run the service in the foreground
+nirudictate autostart           start the service if autostart is enabled
 nirudictate quit                stop the service
 ```
 
@@ -267,36 +294,19 @@ mark while transcribing. Other bars can read
 replaced atomically on every change) or watch the root window property
 `_NIRUDICTATE_STATE`; `nirudictate state` prints the word.
 
-## Privacy
+## Files and paths
 
-- Audio stays in memory, is transcribed on this computer and is then
-  discarded. It is never written to disk (except the panel's microphone test,
-  which writes a temporary file in your private runtime directory and deletes
-  it at once).
-- The history is a local file, `~/.local/state/nirudictate/history.jsonl`,
-  readable only by you (0600). Turn it off or clear it in the panel.
-- Network access: only the model downloads, from GitHub (Swedish models) and
-  Hugging Face (English models). No telemetry, no update checks.
-- The microphone is opened only while you dictate: the recorder process
-  exists only then, so PipeWire shows NIRUDICTATE as a recording client only
-  while the red dot is on.
-
-## How it works
-
-The service waits for the shortcut without any timer. On a press it starts
-`pw-record` for 16 kHz mono audio, shows the overlay and preloads the model.
-When you stop, silence at the ends is trimmed and whisper.cpp transcribes the
-speech on a background thread at low priority (nice 10, SCHED_BATCH, at most
-one thread per physical core), so music, visualizers and the desktop stay
-smooth. The text is cleaned up (known silence hallucinations such as subtitle
-credits are dropped), put on the clipboard, pasted with XTest, and the
-previous clipboard is put back with everything it held. If the window does not
-take the paste, the text is typed instead. See
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-The release contains two builds of whisper.cpp: one for CPUs with AVX2 and
-FMA (most x86_64 computers since 2013–2015) and a baseline one for older
-CPUs. NIRUDICTATE picks the right one when it starts.
+| Path | Purpose |
+|---|---|
+| `~/.local/bin/nirudictate` | Program (AVX2/FMA build) |
+| `~/.local/lib/nirudictate/nirudictate-baseline` | Build for older CPUs |
+| `~/.config/nirudictate/config.toml` | Settings (0600) |
+| `~/.local/share/nirudictate/models/` | Downloaded models |
+| `~/.local/state/nirudictate/history.jsonl` | Dictation history (0600) |
+| `~/.local/state/nirudictate/daemon.log` | Service log when started by the panel or installer |
+| `~/.local/state/niruwm/nirudictate.log` | Service log when started by the NIRUX session |
+| `$XDG_RUNTIME_DIR/nirudictate/state.json` | Live state for bars |
+| `~/.config/autostart/nirudictate.desktop` | XDG autostart entry (other desktops) |
 
 ## Troubleshooting
 
@@ -329,12 +339,74 @@ Start with `nirudictate doctor`.
 ./uninstall.sh --purge  # removes those too
 ```
 
-From NIRUX: `nirux extras unselect nirudictate`, then run the uninstaller from
-a checkout (or delete `~/.local/bin/nirudictate`,
-`~/.local/lib/nirudictate`, `~/.local/share/applications/nirudictate.desktop`
-and `~/.config/autostart/nirudictate.desktop`).
+With NIRUX: `nirux extras unselect nirudictate`, then run the uninstaller from a
+checkout (or delete `~/.local/bin/nirudictate`, `~/.local/lib/nirudictate`,
+`~/.local/share/applications/nirudictate.desktop` and
+`~/.config/autostart/nirudictate.desktop`).
+
+## Building from source
+
+A source build needs Rust 1.88 or newer ([rustup](https://rustup.rs); Debian's
+packaged Rust is too old), `cmake` and a C++ compiler.
+
+```sh
+./install.sh --source
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+```
+
+More: [architecture](docs/ARCHITECTURE.md), [models](docs/MODELS.md),
+[measurements](docs/MEASUREMENTS.md), [testing](docs/TESTING.md),
+[changelog](CHANGELOG.md).
+
+## Status, disclaimer and how it's made
+
+**Status: alpha.** It is the newest member of the suite: dictation, models and the panel work well on my machines, but it has only been in daily use for a short time.
+
+NIRUX and every niru* project are made by me, Nicklas Rudolfsson
+([@nirucon](https://github.com/nirucon)), for me. They are tailored to my own
+needs, preferences and workflows, on my own machines. If they fit yours too,
+that's a nice bonus.
+
+- **Free and open source.** Anyone is free to use, study, change and share
+  it under the [MIT License](LICENSE).
+- **No guarantees.** There is no warranty of any kind. Use it at your own
+  risk, read what you install and keep backups of anything that matters.
+- **How it's made.** Some of these projects I built from scratch by hand. In
+  more recent releases I have used Claude, Anthropic's AI, to do much of the
+  heavy lifting under my direction: I decide what to build and how it should
+  behave, and I test it on my own machines. It saves me a lot of time, and
+  the result is quite OK.
+- **Alpha, beta, dev, and maybe forever.** Most things here are alpha, beta
+  or dev, and may stay that way. Maybe one day there will be a real stable
+  release, but given how fast development moves, and how I am as a person,
+  maybe never :)
+
+| Label | Meaning |
+|---|---|
+| dev | Under active construction; may not build, install or work yet. |
+| alpha | Works on my machines, but incomplete or rough; expect breaking changes. |
+| beta | In daily use on my machines and mostly complete; rough edges remain. |
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Model licenses are listed
-[above](#model-licenses).
+MIT License, see [LICENSE](LICENSE). Copyright (c) 2026 Nicklas Rudolfsson.
+whisper.cpp is MIT licensed.
+
+### Model licenses
+
+| Models | Origin | License |
+|---|---|---|
+| KB-Whisper (Swedish) | [KBLab, National Library of Sweden](https://huggingface.co/KBLab) | **Apache License 2.0** |
+| Whisper (English, Turbo) | [OpenAI](https://github.com/openai/whisper), converted by [whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) | **MIT** |
+
+The Swedish files are KBLab's own whisper.cpp files (`ggml-model.bin`,
+16-bit) converted to 8-bit with whisper.cpp 1.8.3's `whisper-quantize`; that
+is the only change. They are published, with the Apache-2.0 license text and
+their checksums, as the [`models-sv-1`](https://github.com/nirucon/nirudictate/releases/tag/models-sv-1)
+release of this repository; [docs/MODELS.md](docs/MODELS.md) has the exact
+source commits and checksums. The 8-bit files are about 15 % faster than the
+16-bit ones and 20 % faster than KBLab's 5-bit files at the same accuracy.
+The English files are downloaded from the whisper.cpp model repository on
+Hugging Face, pinned to a commit.

@@ -26,6 +26,7 @@ enum Tab {
     Overview,
     Models,
     Shortcut,
+    Agent,
     Output,
     Vocabulary,
     History,
@@ -36,6 +37,7 @@ const TABS: &[(Tab, &str)] = &[
     (Tab::Overview, "Overview"),
     (Tab::Models, "Languages & Models"),
     (Tab::Shortcut, "Shortcut & Mode"),
+    (Tab::Agent, "Agent mode"),
     (Tab::Output, "Output"),
     (Tab::Vocabulary, "Vocabulary"),
     (Tab::History, "History"),
@@ -73,6 +75,11 @@ struct App {
     vocab: String,
     terminals: String,
     capturing_shortcut: bool,
+    capturing_agent: bool,
+    agent_dir: String,
+    agent_name: String,
+    agent_program: String,
+    opencode: Arc<Mutex<Option<Result<crate::agent::Opencode, String>>>>,
     confirm_clear: bool,
     confirm_delete: Option<&'static str>,
     toast: Option<(String, Instant, bool)>,
@@ -157,6 +164,9 @@ impl App {
         let polling = Arc::new(AtomicBool::new(true));
         status_poller(status.clone(), polling.clone(), cc.egui_ctx.clone());
         let vocab = cfg.vocabulary.words.join("\n");
+        let agent_dir = cfg.agent.directory.clone();
+        let agent_name = cfg.agent.agent.clone();
+        let agent_program = cfg.agent.opencode.clone();
         let terminals = cfg.output.terminals.join(", ");
         Self {
             saved: cfg.clone(),
@@ -178,6 +188,11 @@ impl App {
             vocab,
             terminals,
             capturing_shortcut: false,
+            capturing_agent: false,
+            agent_dir,
+            agent_name,
+            agent_program,
+            opencode: Arc::new(Mutex::new(None)),
             confirm_clear: false,
             confirm_delete: None,
             toast: None,
@@ -431,6 +446,7 @@ impl eframe::App for App {
                             Tab::Overview => self.overview(ui, ctx),
                             Tab::Models => self.models_tab(ui, ctx),
                             Tab::Shortcut => self.shortcut_tab(ui, ctx),
+                            Tab::Agent => self.agent_tab(ui, ctx),
                             Tab::Output => self.output_tab(ui),
                             Tab::Vocabulary => self.vocabulary_tab(ui),
                             Tab::History => self.history_tab(ui, ctx),
@@ -494,6 +510,10 @@ impl App {
     fn select(&mut self, tab: Tab) {
         self.tab = tab;
         self.capturing_shortcut = false;
+        self.capturing_agent = false;
+        if tab == Tab::Agent {
+            self.probe_opencode();
+        }
         if tab == Tab::History {
             self.history = history::load();
         }
@@ -1102,6 +1122,250 @@ impl App {
         });
     }
 
+    // ── Agent mode ────────────────────────────────────────────────────────
+
+    /// Ask opencode for its version off the UI thread.
+    fn probe_opencode(&mut self) {
+        let slot = self.opencode.clone();
+        let configured = self.cfg.agent.opencode.clone();
+        let _ = thread::Builder::new()
+            .name("nirudictate-panel-opencode".into())
+            .spawn(move || {
+                let result = match crate::agent::find(&configured) {
+                    Some(path) => crate::agent::probe(&path),
+                    None => Err("opencode is not installed".into()),
+                };
+                if let Ok(mut s) = slot.lock() {
+                    *s = Some(result);
+                }
+            });
+    }
+
+    fn agent_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = self.p();
+        self.heading(
+            ui,
+            "Agent mode",
+            "Talk to opencode: speak, check the text, and it goes to the agent in scratchpad 9.",
+        );
+        let status = self.status().and_then(|s| s.agent);
+        let found = self.opencode.lock().ok().and_then(|o| o.clone());
+        card(ui, &p, |ui| {
+            section_title(ui, &p, "opencode");
+            match &found {
+                Some(Ok(o)) => {
+                    ui.label(
+                        RichText::new(format!("opencode {} — {}", o.version, o.path.display()))
+                            .color(p.success),
+                    );
+                }
+                Some(Err(e)) => {
+                    ui.label(RichText::new(e.clone()).color(p.warning));
+                    ui.label(
+                        RichText::new("Agent mode needs opencode (https://opencode.ai). Without it the agent shortcut is not taken.")
+                            .size(12.0)
+                            .color(p.muted),
+                    );
+                }
+                None => {
+                    ui.label(RichText::new("Looking for opencode…").color(p.muted));
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                }
+            }
+            ui.checkbox(&mut self.cfg.agent.enabled, "Use agent mode");
+        });
+        ui.add_space(12.0);
+        card(ui, &p, |ui| {
+            section_title(ui, &p, "Shortcut");
+            ui.horizontal_wrapped(|ui| {
+                if self.capturing_agent {
+                    ui.label(
+                        RichText::new("Press the new combination… (Esc cancels)").color(p.accent),
+                    );
+                    if let Some(spec) = widgets::capture_shortcut(ctx) {
+                        if spec == "escape" {
+                            self.capturing_agent = false;
+                        } else if hotkey::parse(&spec).is_ok()
+                            && hotkey::parse(&spec).ok()
+                                != hotkey::parse(&self.cfg.shortcut.key).ok()
+                        {
+                            self.cfg.agent.key = spec;
+                            self.capturing_agent = false;
+                        } else {
+                            self.toast(
+                                "Use a modifier with a key, different from the dictation shortcut",
+                                true,
+                            );
+                        }
+                    }
+                } else {
+                    widgets::keycaps(ui, &p, &self.cfg.agent.key);
+                    if ui.button("Change…").clicked() {
+                        self.capturing_agent = true;
+                    }
+                    if self.cfg.agent.key != "shift+alt+space" && ui.button("Default").clicked() {
+                        self.cfg.agent.key = "shift+alt+space".into();
+                    }
+                }
+            });
+            if let Some(a) = &status {
+                if self.cfg.agent.enabled && (a.problem.is_some() || !a.shortcut_active) {
+                    ui.label(
+                        RichText::new(
+                            a.problem
+                                .clone()
+                                .unwrap_or_else(|| "The agent shortcut is not active".into()),
+                        )
+                        .color(p.warning),
+                    );
+                }
+            }
+            ui.label(
+                RichText::new(format!(
+                    "Works like the dictation shortcut ({}): tap to start, it stops after a pause or a second tap; or hold while you speak. Tap twice quickly to start a new conversation.",
+                    self.cfg.shortcut.mode.label()
+                ))
+                .size(12.0)
+                .color(p.muted),
+            );
+            ui.checkbox(
+                &mut self.cfg.agent.double_tap_new,
+                "A quick double tap starts a new conversation",
+            );
+        });
+        ui.add_space(12.0);
+        card(ui, &p, |ui| {
+            section_title(ui, &p, "Before sending");
+            egui::Grid::new("agent-confirm")
+                .num_columns(2)
+                .spacing([18.0, 10.0])
+                .show(ui, |ui| {
+                    ui.label("Send by itself after");
+                    ui.add(
+                        egui::Slider::new(&mut self.cfg.agent.confirm_seconds, 0.0..=10.0)
+                            .step_by(0.5)
+                            .suffix(" s"),
+                    );
+                    ui.end_row();
+                });
+            ui.label(
+                RichText::new("A small box shows what will be sent. Enter sends at once, Esc cancels. 0 s sends without the box.")
+                    .size(12.0)
+                    .color(p.muted),
+            );
+        });
+        ui.add_space(12.0);
+        card(ui, &p, |ui| {
+            section_title(ui, &p, "Conversation");
+            egui::Grid::new("agent-conv")
+                .num_columns(2)
+                .spacing([18.0, 10.0])
+                .show(ui, |ui| {
+                    ui.label("Working folder");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.agent_dir)
+                                .hint_text("~")
+                                .desired_width(280.0),
+                        )
+                        .changed()
+                    {
+                        let d = self.agent_dir.trim();
+                        if d.is_empty() || d.starts_with('~') || d.starts_with('/') {
+                            self.cfg.agent.directory =
+                                if d.is_empty() { "~".into() } else { d.into() };
+                        }
+                    }
+                    ui.end_row();
+                    ui.label("opencode agent");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.agent_name)
+                                .hint_text("default agent")
+                                .desired_width(280.0),
+                        )
+                        .changed()
+                    {
+                        let n = self.agent_name.trim();
+                        if !n.chars().any(char::is_whitespace) {
+                            self.cfg.agent.agent = n.into();
+                        }
+                    }
+                    ui.end_row();
+                });
+            ui.label(
+                RichText::new("opencode works in this folder (~ is your home folder). Leave the agent empty for opencode's default agent. Nothing is approved automatically: opencode asks in its window as usual.")
+                    .size(12.0)
+                    .color(p.muted),
+            );
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                if widgets::primary_button(ui, &p, "Start a new conversation").clicked() {
+                    match ipc::send(&Request::AgentNew, Duration::from_secs(2)) {
+                        Ok(r) if r.ok => {
+                            self.toast("The next message starts a new conversation", false)
+                        }
+                        Ok(r) => self.toast(r.message.unwrap_or_else(|| "failed".into()), true),
+                        Err(e) => self.toast(e, true),
+                    }
+                }
+                if ui.button("Show opencode (Super+Alt+9)").clicked() {
+                    if let Err(e) = ipc::send(&Request::AgentShow, Duration::from_secs(2)) {
+                        self.toast(e, true);
+                    }
+                }
+            });
+            if let Some(a) = &status {
+                let line = match (&a.info.session, a.info.fresh) {
+                    (_, true) => "The next message starts a new conversation.".to_string(),
+                    (Some(id), false) => format!("Continuing conversation {id}."),
+                    (None, false) => "The first message starts a conversation.".to_string(),
+                };
+                ui.label(RichText::new(line).size(12.0).color(p.muted));
+            }
+        });
+        ui.add_space(12.0);
+        card(ui, &p, |ui| {
+            section_title(ui, &p, "Window");
+            egui::Grid::new("agent-window")
+                .num_columns(2)
+                .spacing([18.0, 10.0])
+                .show(ui, |ui| {
+                    ui.label("Terminal");
+                    egui::ComboBox::from_id_salt("agent-terminal")
+                        .selected_text(self.cfg.agent.terminal.clone())
+                        .show_ui(ui, |ui| {
+                            for t in config::TERMINALS {
+                                ui.selectable_value(
+                                    &mut self.cfg.agent.terminal,
+                                    t.to_string(),
+                                    *t,
+                                );
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("opencode program");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.agent_program)
+                                .hint_text("found automatically")
+                                .desired_width(280.0),
+                        )
+                        .lost_focus()
+                    {
+                        self.cfg.agent.opencode = self.agent_program.trim().to_string();
+                        self.probe_opencode();
+                    }
+                    ui.end_row();
+                });
+            ui.label(
+                RichText::new("opencode runs in NIRUWM scratchpad 9 (Super+Alt+9) and comes to the front when a message is sent. Closing that window ends its opencode server; the next message opens it again and continues the conversation.")
+                    .size(12.0)
+                    .color(p.muted),
+            );
+        });
+    }
+
     // ── Output ────────────────────────────────────────────────────────────
 
     fn output_tab(&mut self, ui: &mut egui::Ui) {
@@ -1594,6 +1858,7 @@ pub fn run(tab: Option<&str>) -> Result<(), String> {
     let start_tab = match tab.unwrap_or("overview") {
         "models" | "languages" => Tab::Models,
         "shortcut" | "mode" => Tab::Shortcut,
+        "agent" => Tab::Agent,
         "output" => Tab::Output,
         "vocabulary" => Tab::Vocabulary,
         "history" => Tab::History,

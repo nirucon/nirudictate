@@ -7,7 +7,9 @@
 //! {"version":1,"state":"recording","pid":1234,"pid_start":5678,"since":1793900000.5,"language":"sv"}
 //! ```
 //!
-//! `state` is `idle`, `recording` or `transcribing`. A reader treats the file
+//! `state` is `idle`, `recording` or `transcribing`. While a dictation goes to
+//! the opencode agent (0.2 agent mode) the object also has `"target":"agent"`;
+//! readers that do not know the field simply ignore it. A reader treats the file
 //! as idle when the process `pid` with start time `pid_start` (field 22 of
 //! /proc/PID/stat) is gone. The root window property `_NIRUDICTATE_STATE`
 //! carries the same state word, so an X11 bar that watches root properties
@@ -31,9 +33,9 @@ pub fn now_f64() -> f64 {
         .unwrap_or(0.0)
 }
 
-pub fn write(state: &str, language: &str) {
+pub fn write(state: &str, language: &str, agent: bool) {
     let pid = std::process::id();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "version": 1,
         "state": state,
         "pid": pid,
@@ -41,6 +43,9 @@ pub fn write(state: &str, language: &str) {
         "since": now_f64(),
         "language": language,
     });
+    if agent {
+        body["target"] = serde_json::json!("agent");
+    }
     let _ = ensure_private_dir(&runtime_dir());
     let _ = atomic_write(&live_state_path(), body.to_string().as_bytes(), 0o644);
 }

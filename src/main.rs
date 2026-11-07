@@ -1,4 +1,5 @@
 //! NIRUDICTATE: local speech-to-text dictation for the NIRUX desktop.
+mod agent;
 mod audio;
 mod config;
 mod daemon;
@@ -80,6 +81,12 @@ Usage: nirudictate [COMMAND]
   models verify ID         check a downloaded model against its checksum
   transcribe FILE.wav      transcribe a 16-bit WAV file [--model ID]
   bench FILE.wav [ID...]   time installed models on a WAV file
+  agent [status]           agent mode: opencode, its window and conversation
+  agent toggle             start/stop a dictation for opencode (Shift+Alt+Space)
+  agent new                the next message starts a new conversation
+  agent show               show the opencode window (scratchpad 9, Super+Alt+9)
+  agent send               send the text in the confirmation box now
+  agent file FILE.wav      transcribe a WAV and send it like a spoken message
   doctor                   check the shortcut, audio, models and display
   daemon                   run the background service (normally automatic)
   autostart                start the service if autostart is enabled
@@ -87,7 +94,9 @@ Usage: nirudictate [COMMAND]
   --version | --help
 
 The default shortcut is Ctrl+Alt+Space: tap to start (it stops by itself
-after a pause, or tap again), or hold while speaking and release.";
+after a pause, or tap again), or hold while speaking and release.
+Shift+Alt+Space works the same way but sends the text to opencode (agent
+mode) after a short confirmation; tap twice quickly for a new conversation.";
 
 fn main() -> ExitCode {
     use_baseline_engine_if_needed();
@@ -122,6 +131,7 @@ fn main() -> ExitCode {
         "models" | "model" => models_cmd(rest),
         "transcribe" => transcribe(rest),
         "bench" => bench(rest),
+        "agent" => agent_cmd(rest),
         "doctor" => doctor(),
         other => Err(format!("unknown command {other:?}; see nirudictate --help")),
     };
@@ -207,7 +217,99 @@ fn status(json: bool) -> Result<(), String> {
     if let Some(e) = &s.error {
         println!("problem:   {e}");
     }
+    if let Some(a) = &s.agent {
+        println!(
+            "agent:     {}{}",
+            hotkey::display(&a.shortcut),
+            match &a.problem {
+                Some(p) => format!(" (OFF: {p})"),
+                None if a.shortcut_active => String::new(),
+                None => " (NOT ACTIVE)".into(),
+            }
+        );
+    }
     Ok(())
+}
+
+fn agent_cmd(rest: &[String]) -> Result<(), String> {
+    let sub = rest.first().map(String::as_str).unwrap_or("status");
+    let request = match sub {
+        "status" => {
+            let reply = ipc::send(&Request::Status, Duration::from_secs(3))?;
+            let a = reply
+                .status
+                .and_then(|s| s.agent)
+                .ok_or("this service has no agent mode (update NIRUDICTATE)")?;
+            if rest.iter().any(|x| x == "--json") {
+                println!("{}", serde_json::to_string(&a).map_err(|e| e.to_string())?);
+                return Ok(());
+            }
+            println!(
+                "shortcut:  {}{}",
+                hotkey::display(&a.shortcut),
+                match &a.problem {
+                    Some(p) => format!(" (off: {p})"),
+                    None if a.shortcut_active => " (active)".into(),
+                    None => " (not active)".into(),
+                }
+            );
+            println!(
+                "opencode:  {}{}",
+                a.info.opencode.as_deref().unwrap_or("not found"),
+                a.info
+                    .version
+                    .as_ref()
+                    .map(|v| format!(" ({v})"))
+                    .unwrap_or_default()
+            );
+            println!("folder:    {}", a.info.directory);
+            println!(
+                "server:    {}",
+                if a.info.server {
+                    "running"
+                } else {
+                    "not running"
+                }
+            );
+            println!(
+                "window:    {}",
+                match (a.info.window, a.info.in_slot) {
+                    (true, true) => "open, in scratchpad 9 (Super+Alt+9)",
+                    (true, false) => "open",
+                    _ => "not open (starts with the next message)",
+                }
+            );
+            println!(
+                "session:   {}{}",
+                a.info.session.as_deref().unwrap_or("none yet"),
+                if a.info.fresh {
+                    " (the next message starts a new one)"
+                } else {
+                    ""
+                }
+            );
+            return Ok(());
+        }
+        "toggle" => Request::AgentToggle,
+        "new" => Request::AgentNew,
+        "show" => Request::AgentShow,
+        "send" => Request::AgentSend,
+        "file" => {
+            let path = rest
+                .get(1)
+                .ok_or("usage: nirudictate agent file FILE.wav")?;
+            let path = std::fs::canonicalize(path).map_err(|e| format!("{path}: {e}"))?;
+            Request::AgentFile {
+                path: path.display().to_string(),
+            }
+        }
+        other => {
+            return Err(format!(
+                "unknown agent command {other:?}; try status, toggle, new, show, send or file"
+            ))
+        }
+    };
+    control(request)
 }
 
 fn language(rest: &[String]) -> Result<(), String> {
@@ -482,13 +584,14 @@ fn bench(rest: &[String]) -> Result<(), String> {
 }
 
 fn doctor() -> Result<(), String> {
-    let mut problems = 0;
-    let mut line = |ok: bool, what: &str, detail: String| {
+    let problems = std::cell::Cell::new(0);
+    let line = |ok: bool, what: &str, detail: String| {
         if !ok {
-            problems += 1;
+            problems.set(problems.get() + 1);
         }
         println!("{} {what}: {detail}", if ok { "ok  " } else { "FAIL" });
     };
+    let warn = |what: &str, detail: String| println!("WARN {what}: {detail}");
     let hw = hardware::detect();
     line(
         true,
@@ -507,14 +610,37 @@ fn doctor() -> Result<(), String> {
     );
     let display = std::env::var("DISPLAY").unwrap_or_default();
     match x11rb::connect(None) {
-        Ok((conn, _)) => {
-            use x11rb::connection::RequestConnection;
+        Ok((conn, screen)) => {
+            use x11rb::connection::{Connection, RequestConnection};
             let xtest = conn
                 .extension_information(x11rb::protocol::xtest::X11_EXTENSION_NAME)
                 .ok()
                 .flatten()
                 .is_some();
             line(true, "display", format!("X11 {display}"));
+            let root = conn.setup().roots[screen].root;
+            let cfg = config::Config::load().unwrap_or_default();
+            let options = agent::xkb_options(&conn, root);
+            let clash = agent::conflicting_xkb_options(&options, &cfg.agent.key);
+            if clash.is_empty() {
+                line(
+                    true,
+                    "agent key",
+                    format!(
+                        "{}: no keyboard-layout option uses it",
+                        hotkey::display(&cfg.agent.key)
+                    ),
+                );
+            } else {
+                warn(
+                    "agent key",
+                    format!(
+                        "{} clashes with the XKB option {} (it also switches the keyboard layout); choose another agent shortcut or remove the option",
+                        hotkey::display(&cfg.agent.key),
+                        clash.join(", ")
+                    ),
+                );
+            }
             line(
                 xtest,
                 "XTest",
@@ -582,8 +708,65 @@ fn doctor() -> Result<(), String> {
             "nirux not found (silent)".into()
         },
     );
-    if problems > 0 {
-        return Err(format!("{problems} problem(s) found"));
+    let cfg = config::Config::load().unwrap_or_default();
+    if !cfg.agent.enabled {
+        warn("agent", "agent mode is turned off in the settings".into());
+    } else {
+        match agent::find(&cfg.agent.opencode) {
+            None => warn(
+                "agent",
+                format!(
+                    "opencode is not installed, so agent mode ({}) is off and its shortcut is not grabbed; install opencode from https://opencode.ai",
+                    hotkey::display(&cfg.agent.key)
+                ),
+            ),
+            Some(path) => match agent::probe(&path) {
+                Ok(o) => line(
+                    true,
+                    "agent",
+                    format!(
+                        "opencode {} ({}, {} API), folder {}",
+                        o.version,
+                        o.path.display(),
+                        match o.api {
+                            agent::Api::V1 => "1.x",
+                            agent::Api::V2 => "2.x",
+                        },
+                        cfg.agent.folder().display()
+                    ),
+                ),
+                Err(e) => line(false, "agent", e),
+            },
+        }
+        if !cfg.agent.folder().is_dir() {
+            line(
+                false,
+                "agent folder",
+                format!("{} does not exist", cfg.agent.folder().display()),
+            );
+        }
+        if let Ok(r) = ipc::send(&Request::Status, Duration::from_secs(2)) {
+            if let Some(a) = r.status.and_then(|s| s.agent) {
+                match (&a.problem, a.shortcut_active) {
+                    (None, true) => line(
+                        true,
+                        "agent shortcut",
+                        format!("{} grabbed", hotkey::display(&a.shortcut)),
+                    ),
+                    (Some(p), _) if a.info.opencode.is_none() || !a.enabled => {
+                        let _ = p;
+                    }
+                    (p, _) => line(
+                        false,
+                        "agent shortcut",
+                        p.clone().unwrap_or_else(|| "not active".into()),
+                    ),
+                }
+            }
+        }
+    }
+    if problems.get() > 0 {
+        return Err(format!("{} problem(s) found", problems.get()));
     }
     Ok(())
 }

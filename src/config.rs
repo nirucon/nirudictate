@@ -317,6 +317,61 @@ impl Default for Advanced {
     }
 }
 
+/// Agent mode: a second shortcut whose dictation goes to opencode instead of
+/// the text cursor (see `agent.rs`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Agent {
+    /// Grab the agent shortcut (only when opencode is installed).
+    pub enabled: bool,
+    pub key: String,
+    /// The folder opencode works in; `~` is the home folder.
+    pub directory: String,
+    /// An opencode agent name; empty uses opencode's default agent.
+    pub agent: String,
+    /// The confirmation box sends by itself after this many seconds
+    /// (Enter sends at once, Esc cancels). 0 sends without the box.
+    pub confirm_seconds: f32,
+    /// Two quick taps of the agent shortcut start a new conversation.
+    pub double_tap_new: bool,
+    /// `auto` (kitty, alacritty, xterm), or one of those names.
+    pub terminal: String,
+    /// Path to the opencode program; empty finds it on PATH and in
+    /// ~/.opencode/bin and ~/.local/bin.
+    pub opencode: String,
+}
+
+impl Default for Agent {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            key: "shift+alt+space".into(),
+            directory: "~".into(),
+            agent: String::new(),
+            confirm_seconds: 2.0,
+            double_tap_new: true,
+            terminal: "auto".into(),
+            opencode: String::new(),
+        }
+    }
+}
+
+pub const TERMINALS: &[&str] = &["auto", "kitty", "alacritty", "xterm"];
+
+impl Agent {
+    /// `directory` with `~` expanded.
+    pub fn folder(&self) -> PathBuf {
+        let d = self.directory.trim();
+        if d.is_empty() || d == "~" {
+            return home();
+        }
+        if let Some(rest) = d.strip_prefix("~/") {
+            return home().join(rest);
+        }
+        PathBuf::from(d)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -327,6 +382,7 @@ pub struct Config {
     pub vocabulary: Vocabulary,
     pub history: History,
     pub advanced: Advanced,
+    pub agent: Agent,
 }
 
 pub const LANGUAGES: &[(&str, &str)] = &[("sv", "Swedish"), ("en", "English")];
@@ -368,6 +424,33 @@ impl Config {
         }
         if !(0..=19).contains(&self.advanced.nice) {
             return Err("advanced.nice must be between 0 and 19".into());
+        }
+        let agent_key =
+            crate::hotkey::parse(&self.agent.key).map_err(|e| format!("agent.key: {e}"))?;
+        if crate::hotkey::parse(&self.shortcut.key).ok() == Some(agent_key) {
+            return Err("agent.key must differ from shortcut.key".into());
+        }
+        if !(0.0..=10.0).contains(&self.agent.confirm_seconds) {
+            return Err("agent.confirm_seconds must be between 0 and 10".into());
+        }
+        if !TERMINALS.contains(&self.agent.terminal.as_str()) {
+            return Err(format!(
+                "agent.terminal must be one of {}, not {:?}",
+                TERMINALS.join(", "),
+                self.agent.terminal
+            ));
+        }
+        let folder = self.agent.directory.trim();
+        if !(folder.is_empty() || folder.starts_with('~') || folder.starts_with('/')) {
+            return Err("agent.directory must be an absolute path or start with ~".into());
+        }
+        if self
+            .agent
+            .agent
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err("agent.agent must be a single opencode agent name".into());
         }
         Ok(())
     }
@@ -459,6 +542,31 @@ mod tests {
         assert_eq!(cfg.shortcut.mode, Mode::Hold);
         assert_eq!(cfg.shortcut.key, "ctrl+alt+space");
         assert!(cfg.output.restore_clipboard);
+    }
+
+    #[test]
+    fn agent_mode_defaults_and_checks() {
+        let cfg = Config::default();
+        assert!(cfg.agent.enabled);
+        assert_eq!(cfg.agent.key, "shift+alt+space");
+        assert_eq!(cfg.agent.confirm_seconds, 2.0);
+        assert_eq!(cfg.agent.folder(), home());
+        let cfg = Config::parse("[agent]\ndirectory = \"~/src\"\nagent = \"plan\"\n").unwrap();
+        assert_eq!(cfg.agent.folder(), home().join("src"));
+        assert_eq!(cfg.agent.agent, "plan");
+        // A 0.1 file without [agent] still loads.
+        assert_eq!(
+            Config::parse("[general]\nlanguage = \"en\"\n")
+                .unwrap()
+                .agent,
+            Agent::default()
+        );
+        assert!(Config::parse("[agent]\nkey = \"ctrl+alt+space\"\n").is_err());
+        assert!(Config::parse("[agent]\nconfirm_seconds = 30\n").is_err());
+        assert!(Config::parse("[agent]\nterminal = \"gnome-terminal\"\n").is_err());
+        assert!(Config::parse("[agent]\ndirectory = \"relative/dir\"\n").is_err());
+        assert!(Config::parse("[agent]\nagent = \"two words\"\n").is_err());
+        assert!(Config::parse("[agent]\nauto = true\n").is_err());
     }
 
     #[test]

@@ -5,13 +5,14 @@
 //! One thread waits in `poll` on the X connection, a wake pipe and a signal
 //! pipe. While idle nothing runs and nothing times out: no microphone, no
 //! model, no animation, no timers.
+use crate::agent::{self, Outcome};
 use crate::audio::{self, Capture};
 use crate::config::{self, Config};
 use crate::engine::{self, Engine, Job, Loaded, Transcript};
 use crate::hardware::{self, Hardware};
 use crate::hotkey::{self, Action, Controller};
 use crate::insert::{Insert, Inserter};
-use crate::ipc::{LastResult, Reply, Request, Status};
+use crate::ipc::{AgentStatus, LastResult, Reply, Request, Status};
 use crate::models::{self, Model};
 use crate::overlay::{self, Overlay, View};
 use crate::sounds::{self, Cue};
@@ -113,6 +114,19 @@ enum Phase {
         transcript: Transcript,
         text: String,
     },
+    /// Agent mode: the transcript waits in the confirmation box.
+    Confirming {
+        transcript: Transcript,
+        text: String,
+        until: Instant,
+        total: Duration,
+    },
+    /// Agent mode: the agent thread hands the message to opencode.
+    Sending {
+        transcript: Transcript,
+        text: String,
+        started: Instant,
+    },
 }
 
 impl Phase {
@@ -120,10 +134,26 @@ impl Phase {
         match self {
             Phase::Idle => "idle",
             Phase::Recording { .. } => "recording",
-            Phase::Transcribing { .. } | Phase::Inserting { .. } => "transcribing",
+            // `transcribing` keeps the version 1 state contract for bars.
+            Phase::Transcribing { .. }
+            | Phase::Inserting { .. }
+            | Phase::Confirming { .. }
+            | Phase::Sending { .. } => "transcribing",
         }
     }
 }
+
+/// Where the current dictation goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    /// Pasted or typed at the text cursor (Ctrl+Alt+Space).
+    Text,
+    /// Sent to opencode (Shift+Alt+Space).
+    Agent,
+}
+
+/// Escape, Return and KP_Enter answer the confirmation box.
+const CONFIRM_KEYS: [u32; 3] = [0xff1b, 0xff0d, 0xff8d];
 
 type Client = (Request, Sender<Reply>);
 type PendingFile = (Sender<Reply>, Receiver<Result<Transcript, String>>);
@@ -146,6 +176,15 @@ struct Daemon {
     phase: Phase,
     grabbed: Vec<(u8, u16)>,
     shortcut_error: Option<String>,
+    agent: Option<agent::Agent>,
+    agent_done: Receiver<Outcome>,
+    agent_grabbed: Vec<(u8, u16)>,
+    agent_error: Option<String>,
+    /// Keycodes grabbed while the confirmation box is up, with their keysym.
+    confirm_grabbed: Vec<(u8, u32)>,
+    target: Target,
+    /// The agent dictation starts a new conversation (double tap).
+    fresh: bool,
     last: Option<LastResult>,
     error: Option<String>,
     message: Option<(View, Instant)>,
@@ -255,6 +294,9 @@ pub fn run(foreground_message: bool) -> Result<(), String> {
         }
     };
     let clients = listen(waker.clone())?;
+    let (agent_tx, agent_done) = mpsc::channel();
+    let w = waker.clone();
+    let agent = agent::Agent::spawn(cfg.agent.clone(), agent_tx, move || w.wake());
     let state_atom = intern(&conn, "_NIRUDICTATE_STATE");
     let utf8 = intern(&conn, "UTF8_STRING");
     let scale = dpi_scale(&conn, root);
@@ -280,6 +322,13 @@ pub fn run(foreground_message: bool) -> Result<(), String> {
         phase: Phase::Idle,
         grabbed: Vec::new(),
         shortcut_error: None,
+        agent: Some(agent),
+        agent_done,
+        agent_grabbed: Vec::new(),
+        agent_error: None,
+        confirm_grabbed: Vec::new(),
+        target: Target::Text,
+        fresh: false,
         last: None,
         error: None,
         message: None,
@@ -293,11 +342,15 @@ pub fn run(foreground_message: bool) -> Result<(), String> {
     d.grab();
     d.publish();
     eprintln!(
-        "nirudictate {}: ready ({}, {}, engine {})",
+        "nirudictate {}: ready ({}, {}, engine {}; agent {})",
         env!("CARGO_PKG_VERSION"),
         hotkey::display(&d.cfg.shortcut.key),
         d.cfg.general.language,
-        crate::engine_variant()
+        crate::engine_variant(),
+        match &d.agent_error {
+            None => hotkey::display(&d.cfg.agent.key),
+            Some(e) => e.clone(),
+        }
     );
     let result = d.run(wake_read, sig_read);
     d.shutdown();
@@ -408,6 +461,10 @@ impl Daemon {
 
     /// How long the loop may sleep: forever when idle.
     fn timeout_ms(&self) -> i32 {
+        if matches!(self.phase, Phase::Sending { .. }) {
+            // Only the "Sending…" animation; the agent thread wakes us.
+            return 50;
+        }
         if !matches!(self.phase, Phase::Idle) || !self.pending_files.is_empty() {
             return 33;
         }
@@ -423,6 +480,9 @@ impl Daemon {
     fn shutdown(&mut self) {
         self.phase = Phase::Idle;
         self.ungrab();
+        self.ungrab_confirm();
+        // Stops the opencode window and server.
+        self.agent = None;
         let _ = self.conn.delete_property(self.root, self.state_atom);
         let _ = self.conn.flush();
         live::remove();
@@ -451,7 +511,11 @@ impl Daemon {
     }
 
     fn ungrab(&mut self) {
-        for (code, mods) in self.grabbed.drain(..) {
+        let lists = [
+            std::mem::take(&mut self.grabbed),
+            std::mem::take(&mut self.agent_grabbed),
+        ];
+        for (code, mods) in lists.into_iter().flatten() {
             for extra in [0u16, 2, 16, 18] {
                 let _ = self
                     .conn
@@ -461,24 +525,24 @@ impl Daemon {
         let _ = self.conn.flush();
     }
 
-    fn grab(&mut self) {
-        self.ungrab();
-        self.shortcut_error = None;
-        let shortcut = match hotkey::parse(&self.cfg.shortcut.key) {
+    /// Grab one combination on every keycode that carries its key, with the
+    /// Lock/NumLock variants. Returns what was grabbed and the problem, if any.
+    fn grab_combo(&self, spec: &str) -> (Vec<(u8, u16)>, Option<String>) {
+        let shortcut = match hotkey::parse(spec) {
             Ok(s) => s,
-            Err(e) => {
-                self.shortcut_error = Some(e);
-                return;
-            }
+            Err(e) => return (Vec::new(), Some(e)),
         };
         let codes = self.keycodes(shortcut.keysym);
         if codes.is_empty() {
-            self.shortcut_error = Some(format!(
-                "{} is not on this keyboard layout",
-                hotkey::display(&self.cfg.shortcut.key)
-            ));
-            return;
+            return (
+                Vec::new(),
+                Some(format!(
+                    "{} is not on this keyboard layout",
+                    hotkey::display(spec)
+                )),
+            );
         }
+        let mut grabbed = Vec::new();
         let mut failed = false;
         for code in codes {
             let mut ok = true;
@@ -496,7 +560,7 @@ impl Daemon {
                 }
             }
             if ok {
-                self.grabbed.push((code, shortcut.mods));
+                grabbed.push((code, shortcut.mods));
             } else {
                 failed = true;
                 for extra in [0u16, 2, 16, 18] {
@@ -506,20 +570,85 @@ impl Daemon {
                 }
             }
         }
-        if self.grabbed.is_empty() && failed {
-            self.shortcut_error = Some(format!(
+        let problem = (grabbed.is_empty() && failed).then(|| {
+            format!(
                 "{} is already used by another program; choose another shortcut",
-                hotkey::display(&self.cfg.shortcut.key)
-            ));
+                hotkey::display(spec)
+            )
+        });
+        (grabbed, problem)
+    }
+
+    fn grab(&mut self) {
+        self.ungrab();
+        let (grabbed, problem) = self.grab_combo(&self.cfg.shortcut.key.clone());
+        self.grabbed = grabbed;
+        self.shortcut_error = problem;
+        self.agent_error = if !self.cfg.agent.enabled {
+            Some("agent mode is turned off in the settings".into())
+        } else if agent::find(&self.cfg.agent.opencode).is_none() {
+            Some(format!(
+                "opencode is not installed, so agent mode ({}) is off",
+                hotkey::display(&self.cfg.agent.key)
+            ))
+        } else {
+            let (grabbed, problem) = self.grab_combo(&self.cfg.agent.key.clone());
+            self.agent_grabbed = grabbed;
+            problem
+        };
+        let _ = self.conn.flush();
+    }
+
+    /// Escape and Enter for the confirmation box, only while it is shown.
+    fn grab_confirm(&mut self) {
+        self.ungrab_confirm();
+        for keysym in CONFIRM_KEYS {
+            for code in self.keycodes(keysym) {
+                let mut ok = true;
+                for extra in [0u16, 2, 16, 18] {
+                    let cookie = self.conn.grab_key(
+                        true,
+                        self.root,
+                        ModMask::from(extra),
+                        code,
+                        GrabMode::ASYNC,
+                        GrabMode::ASYNC,
+                    );
+                    if cookie.map(|c| c.check().is_err()).unwrap_or(true) {
+                        ok = false;
+                    }
+                }
+                if ok {
+                    self.confirm_grabbed.push((code, keysym));
+                }
+            }
         }
         let _ = self.conn.flush();
     }
 
-    fn matches(&self, code: u8, state: u16) -> bool {
+    fn ungrab_confirm(&mut self) {
+        for (code, _) in std::mem::take(&mut self.confirm_grabbed) {
+            for extra in [0u16, 2, 16, 18] {
+                let _ = self.conn.ungrab_key(code, self.root, ModMask::from(extra));
+            }
+        }
+        let _ = self.conn.flush();
+    }
+
+    /// Which shortcut a key press is, if any.
+    fn matches(&self, code: u8, state: u16) -> Option<Target> {
         const MEANINGFUL: u16 = hotkey::SHIFT | hotkey::CONTROL | hotkey::MOD1 | hotkey::MOD4;
-        self.grabbed
-            .iter()
-            .any(|(c, m)| *c == code && (state & MEANINGFUL) == *m)
+        let hit = |list: &[(u8, u16)]| {
+            list.iter()
+                .any(|(c, m)| *c == code && (state & MEANINGFUL) == *m)
+        };
+        if hit(&self.grabbed) {
+            Some(Target::Text)
+        } else if hit(&self.agent_grabbed) {
+            Some(Target::Agent)
+        } else {
+            None
+        }
     }
 
     fn event(&mut self, event: Event) {
@@ -528,25 +657,55 @@ impl Daemon {
         }
         match event {
             Event::KeyPress(e) => {
+                let confirm_key = self
+                    .confirm_grabbed
+                    .iter()
+                    .find(|(c, _)| *c == e.detail)
+                    .map(|(_, k)| *k);
+                if let Some(keysym) = confirm_key {
+                    if matches!(self.phase, Phase::Confirming { .. }) {
+                        if keysym == 0xff1b {
+                            self.cancel();
+                            self.notice("Not sent".into(), false);
+                        } else {
+                            self.send_to_agent();
+                        }
+                    }
+                    return;
+                }
                 // A held key repeats its press (detectable auto-repeat sends
                 // no releases in between); only the first press counts.
                 if self.key_down {
                     return;
                 }
-                if self.matches(e.detail, u16::from(e.state)) {
+                if let Some(target) = self.matches(e.detail, u16::from(e.state)) {
                     self.key_down = true;
                     let busy = matches!(
                         self.phase,
-                        Phase::Transcribing { .. } | Phase::Inserting { .. }
+                        Phase::Transcribing { .. }
+                            | Phase::Inserting { .. }
+                            | Phase::Confirming { .. }
+                            | Phase::Sending { .. }
                     );
-                    let action = self.controller.press(Instant::now(), busy);
+                    if matches!(self.phase, Phase::Idle) {
+                        self.target = target;
+                    }
+                    let double = target == Target::Agent
+                        && self.target == Target::Agent
+                        && self.cfg.agent.double_tap_new;
+                    let action = self.controller.press(Instant::now(), busy, double);
                     self.act(action);
                 }
             }
             Event::KeyRelease(e) => {
                 // The release may come with different modifiers (Ctrl let go
-                // first); any release of the grabbed key counts.
-                if self.grabbed.iter().any(|(c, _)| *c == e.detail) {
+                // first); any release of a grabbed key counts.
+                if self
+                    .grabbed
+                    .iter()
+                    .chain(self.agent_grabbed.iter())
+                    .any(|(c, _)| *c == e.detail)
+                {
                     self.key_down = false;
                     let action = self.controller.release(Instant::now());
                     self.act(action);
@@ -561,6 +720,13 @@ impl Daemon {
         match action {
             Action::Start => self.start(),
             Action::Stop => self.stop(),
+            Action::DoubleTap => {
+                if self.target == Target::Agent && matches!(self.phase, Phase::Recording { .. }) {
+                    self.fresh = true;
+                    log("double tap: this message starts a new conversation".into());
+                    self.draw();
+                }
+            }
             Action::None => {}
         }
     }
@@ -578,6 +744,13 @@ impl Daemon {
 
     fn start(&mut self) {
         if !matches!(self.phase, Phase::Idle) {
+            return;
+        }
+        self.fresh = false;
+        if self.target == Target::Agent && agent::find(&self.cfg.agent.opencode).is_none() {
+            self.controller.reset();
+            self.notice("opencode is not installed; agent mode is off".into(), true);
+            self.cue(Cue::Error);
             return;
         }
         let Some(model) = self.current_model() else {
@@ -603,9 +776,14 @@ impl Daemon {
                 };
                 self.cue(Cue::Start);
                 log(format!(
-                    "recording ({}, {})",
+                    "recording ({}, {}{})",
                     model.id,
-                    self.cfg.advanced.microphone_label()
+                    self.cfg.advanced.microphone_label(),
+                    if self.target == Target::Agent {
+                        ", for the agent"
+                    } else {
+                        ""
+                    }
                 ));
                 self.publish();
                 self.draw();
@@ -664,6 +842,11 @@ impl Daemon {
         if matches!(self.phase, Phase::Transcribing { .. }) {
             // The engine finishes the job; its result is dropped.
             self.phase = Phase::Idle;
+        }
+        if matches!(self.phase, Phase::Confirming { .. }) {
+            self.phase = Phase::Idle;
+            self.ungrab_confirm();
+            log("agent message cancelled".into());
         }
         self.controller.reset();
         self.hide();
@@ -751,7 +934,19 @@ impl Daemon {
                 }
             });
         match &mut self.phase {
-            Phase::Idle => {}
+            Phase::Idle => while self.agent_done.try_recv().is_ok() {},
+            Phase::Confirming { until, .. } => {
+                if Instant::now() >= *until {
+                    self.send_to_agent();
+                } else {
+                    self.draw();
+                }
+            }
+            Phase::Sending { .. } => match self.agent_done.try_recv() {
+                Ok(outcome) => self.agent_outcome(outcome),
+                Err(TryRecvError::Empty) => self.draw(),
+                Err(TryRecvError::Disconnected) => self.fail("agent mode stopped".into()),
+            },
             Phase::Recording {
                 capture,
                 levels_seen,
@@ -827,9 +1022,10 @@ impl Daemon {
     }
 
     fn transcribed(&mut self, transcript: Transcript) {
+        let agent = self.target == Target::Agent;
         let options = text::Options {
             capitalize: self.cfg.output.capitalize,
-            trailing_space: self.cfg.output.trailing_space,
+            trailing_space: self.cfg.output.trailing_space && !agent,
         };
         let Some(text) = text::finish(&transcript.text, options) else {
             self.phase = Phase::Idle;
@@ -838,6 +1034,10 @@ impl Daemon {
             return;
         };
         crate::measure::record(&transcript);
+        if agent {
+            self.confirm(transcript, text.trim().to_string());
+            return;
+        }
         self.hide();
         let Some(inserter) = &self.inserter else {
             self.fail("text insertion is unavailable (XTest missing?)".into());
@@ -868,6 +1068,13 @@ impl Daemon {
             transcript.seconds,
             transcript.load_seconds
         ));
+        self.record(transcript, &text, how);
+        self.cue(Cue::Done);
+        self.publish();
+    }
+
+    /// History and the last result, for a pasted or a sent dictation.
+    fn record(&mut self, transcript: Transcript, text: &str, how: String) {
         let time = history::now();
         if self.cfg.history.enabled {
             let entry = history::Entry {
@@ -890,8 +1097,105 @@ impl Daemon {
             seconds: transcript.seconds + transcript.load_seconds,
             inserted_by: how,
         });
-        self.cue(Cue::Done);
+    }
+
+    // ── agent mode ────────────────────────────────────────────────────────
+
+    /// Show the transcript in the confirmation box; it sends by itself after
+    /// `confirm_seconds` (Enter at once, Esc cancels).
+    fn confirm(&mut self, transcript: Transcript, text: String) {
+        let secs = self.cfg.agent.confirm_seconds;
+        let total = Duration::from_secs_f32(secs.max(0.0));
+        self.phase = Phase::Confirming {
+            transcript,
+            text,
+            until: Instant::now() + total,
+            total,
+        };
+        // Without the box there is nothing to answer; send at once.
+        if secs <= 0.0 || !self.cfg.general.overlay {
+            self.send_to_agent();
+            return;
+        }
+        self.grab_confirm();
+        log(format!(
+            "agent message ready; it sends in {secs:.1} s (Enter sends now, Esc cancels)"
+        ));
+        self.palette = Some(self.resolve_palette());
         self.publish();
+        self.draw();
+    }
+
+    fn send_to_agent(&mut self) {
+        let Phase::Confirming {
+            transcript, text, ..
+        } = std::mem::replace(&mut self.phase, Phase::Idle)
+        else {
+            return;
+        };
+        self.ungrab_confirm();
+        let new_session = std::mem::take(&mut self.fresh);
+        let Some(agent) = &self.agent else {
+            self.fail("agent mode is not running".into());
+            return;
+        };
+        agent.send(agent::Job::Deliver {
+            text: text.clone(),
+            new_session,
+        });
+        self.phase = Phase::Sending {
+            transcript,
+            text,
+            started: Instant::now(),
+        };
+        self.publish();
+        self.draw();
+    }
+
+    fn agent_outcome(&mut self, outcome: Outcome) {
+        let Phase::Sending {
+            transcript, text, ..
+        } = std::mem::replace(&mut self.phase, Phase::Idle)
+        else {
+            return;
+        };
+        match outcome {
+            Outcome::Sent {
+                new_session,
+                seconds,
+            } => {
+                log(format!(
+                    "sent {} characters to opencode in {seconds:.1} s ({}: {:.1} s audio, {:.2} s + {:.2} s load)",
+                    text.chars().count(),
+                    transcript.model,
+                    transcript.audio_seconds,
+                    transcript.seconds,
+                    transcript.load_seconds
+                ));
+                self.record(transcript, &text, "sent to opencode".into());
+                self.cue(Cue::Done);
+                self.notice(
+                    if new_session {
+                        "Sent to opencode · new conversation".into()
+                    } else {
+                        "Sent to opencode".into()
+                    },
+                    false,
+                );
+                self.publish();
+            }
+            Outcome::Failed(e) => self.fail(e),
+        }
+    }
+
+    fn agent_status(&self) -> AgentStatus {
+        AgentStatus {
+            enabled: self.cfg.agent.enabled,
+            shortcut: self.cfg.agent.key.clone(),
+            shortcut_active: !self.agent_grabbed.is_empty(),
+            problem: self.agent_error.clone(),
+            info: self.agent.as_ref().map(|a| a.info()).unwrap_or_default(),
+        }
     }
 
     // ── overlay ───────────────────────────────────────────────────────────
@@ -927,8 +1231,27 @@ impl Daemon {
                     levels,
                     language: self.language(),
                     holding: self.controller.holding(),
+                    agent: self.target == Target::Agent,
+                    fresh: self.fresh,
                 })
             }
+            Phase::Confirming {
+                text, until, total, ..
+            } => Some(View::Confirm {
+                text: text.clone(),
+                left: if total.is_zero() {
+                    0.0
+                } else {
+                    until
+                        .saturating_duration_since(Instant::now())
+                        .as_secs_f32()
+                        / total.as_secs_f32()
+                },
+                fresh: self.fresh,
+            }),
+            Phase::Sending { started, .. } => Some(View::Sending {
+                phase: started.elapsed().as_secs_f32(),
+            }),
             Phase::Transcribing { started, .. } => Some(View::Transcribing {
                 phase: started.elapsed().as_secs_f32(),
             }),
@@ -983,7 +1306,8 @@ impl Daemon {
     fn publish(&mut self) {
         let word = self.phase.word();
         let lang = self.language();
-        live::write(word, &lang);
+        let agent = self.target == Target::Agent && !matches!(self.phase, Phase::Idle);
+        live::write(word, &lang, agent);
         let _ = self.conn.change_property8(
             PropMode::REPLACE,
             self.root,
@@ -1016,6 +1340,7 @@ impl Daemon {
             engine: crate::engine_variant().into(),
             last: self.last.clone(),
             error: self.shortcut_error.clone().or_else(|| self.error.clone()),
+            agent: Some(self.agent_status()),
         }
     }
 
@@ -1037,6 +1362,9 @@ impl Daemon {
             let _ = history::trim(self.cfg.history.keep);
         }
         self.palette = None;
+        if let Some(agent) = &self.agent {
+            agent.send(agent::Job::Settings(self.cfg.agent.clone()));
+        }
         self.grab();
         self.publish();
         Ok(())
@@ -1051,6 +1379,7 @@ impl Daemon {
             },
             Request::Start => {
                 if matches!(self.phase, Phase::Idle) {
+                    self.target = Target::Text;
                     self.start();
                     if matches!(self.phase, Phase::Recording { .. }) {
                         self.controller.started_elsewhere();
@@ -1066,12 +1395,79 @@ impl Daemon {
                 if matches!(self.phase, Phase::Recording { .. }) {
                     self.stop();
                 } else if matches!(self.phase, Phase::Idle) {
+                    self.target = Target::Text;
                     self.start();
                     if matches!(self.phase, Phase::Recording { .. }) {
                         self.controller.started_elsewhere();
                     }
                 }
                 self.ok_status()
+            }
+            Request::AgentToggle => {
+                if matches!(self.phase, Phase::Recording { .. }) {
+                    self.stop();
+                } else if matches!(self.phase, Phase::Idle) {
+                    self.target = Target::Agent;
+                    self.start();
+                    if matches!(self.phase, Phase::Recording { .. }) {
+                        self.controller.started_elsewhere();
+                    }
+                }
+                self.ok_status()
+            }
+            Request::AgentNew => {
+                if self.target == Target::Agent && !matches!(self.phase, Phase::Idle) {
+                    self.fresh = true;
+                } else if let Some(agent) = &self.agent {
+                    agent.send(agent::Job::NewSession);
+                }
+                self.ok_status()
+            }
+            Request::AgentShow => {
+                if let Some(agent) = &self.agent {
+                    agent.send(agent::Job::Show);
+                }
+                self.ok_status()
+            }
+            Request::AgentSend => {
+                self.send_to_agent();
+                self.ok_status()
+            }
+            Request::AgentFile { path } => {
+                if !matches!(self.phase, Phase::Idle) {
+                    Reply::error("NIRUDICTATE is busy")
+                } else if agent::find(&self.cfg.agent.opencode).is_none() {
+                    Reply::error("opencode is not installed; agent mode is off")
+                } else {
+                    match (
+                        self.current_model(),
+                        audio::read_wav(std::path::Path::new(&path)),
+                    ) {
+                        (None, _) => Reply::error("no installed model"),
+                        (_, Err(e)) => Reply::error(e),
+                        (Some(model), Ok(samples)) => {
+                            let (tx, rx) = mpsc::channel();
+                            self.engine.send(Job::Transcribe(engine::Request {
+                                samples,
+                                model,
+                                prompt: text::prompt(&self.cfg.vocabulary.words, model.language),
+                                threads: self.cfg.threads(),
+                                full_window: false,
+                                reply: tx,
+                            }));
+                            self.target = Target::Agent;
+                            self.fresh = false;
+                            self.palette = Some(self.resolve_palette());
+                            self.phase = Phase::Transcribing {
+                                rx,
+                                started: Instant::now(),
+                            };
+                            self.publish();
+                            self.draw();
+                            self.ok_status()
+                        }
+                    }
+                }
             }
             Request::Cancel => {
                 self.cancel();

@@ -26,14 +26,76 @@ pub enum View {
         levels: Vec<f32>,
         language: String,
         holding: bool,
+        /// Agent mode: `AI` (and `NEW` for a new conversation) by the language.
+        agent: bool,
+        fresh: bool,
     },
     Transcribing {
+        phase: f32,
+    },
+    /// Agent mode: the transcript, sent by itself when `left` reaches 0.
+    Confirm {
+        text: String,
+        /// Share of the waiting time left, 1 → 0.
+        left: f32,
+        fresh: bool,
+    },
+    /// Agent mode: handing the message to opencode.
+    Sending {
         phase: f32,
     },
     Message {
         text: String,
         error: bool,
     },
+}
+
+/// Break `text` into at most `max` lines of `width` pixels; the last line
+/// ends with an ellipsis when text is left over.
+pub fn wrap(font: &FontArc, size: f32, text: &str, width: f32, max: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut words = text.split_whitespace().peekable();
+    let mut cut = false;
+    while let Some(word) = words.next() {
+        let candidate = if line.is_empty() {
+            word.to_string()
+        } else {
+            format!("{line} {word}")
+        };
+        if text_width(font, size, &candidate) <= width || line.is_empty() {
+            line = candidate;
+            continue;
+        }
+        lines.push(std::mem::take(&mut line));
+        if lines.len() == max {
+            cut = true;
+            break;
+        }
+        line = word.to_string();
+        if words.peek().is_none() {
+            break;
+        }
+    }
+    if !cut && !line.is_empty() {
+        if lines.len() == max {
+            cut = true;
+        } else {
+            lines.push(line);
+        }
+    }
+    // A single word longer than the line, or text left over: shorten.
+    for (i, l) in lines.iter_mut().enumerate() {
+        let last = i + 1 == max;
+        if text_width(font, size, l) > width || (last && cut) {
+            let mut t: String = l.clone();
+            while !t.is_empty() && text_width(font, size, &format!("{t}…")) > width {
+                t.pop();
+            }
+            *l = format!("{}…", t.trim_end());
+        }
+    }
+    lines
 }
 
 struct Colors {
@@ -214,6 +276,9 @@ pub fn render(
 ) -> Canvas {
     let colors = Colors::from(palette, translucent);
     let s = scale;
+    if let View::Confirm { text, left, fresh } = view {
+        return render_confirm(text, *left, *fresh, &colors, font, s);
+    }
     let h = (44.0 * s).round();
     let w = match view {
         View::Message { text, .. } => {
@@ -240,14 +305,17 @@ pub fn render(
             levels,
             language,
             holding,
+            agent,
+            fresh,
         } => {
             // Pulsing red dot.
             let pulse = 0.65 + 0.35 * (seconds * std::f32::consts::TAU * 0.8).cos().abs();
             let mut red = colors.red;
             red[3] = pulse;
             c.circle(22.0 * s, mid, 6.5 * s, red);
-            // Level meter: newest on the right.
-            let bars = 26usize;
+            // Level meter: newest on the right (shorter when the agent label
+            // needs the room).
+            let bars = if *agent { 18usize } else { 26 };
             let left = 40.0 * s;
             let bar_w = 3.0 * s;
             let gap = 2.4 * s;
@@ -270,9 +338,22 @@ pub fn render(
             let tw = text_width(font, size, &time);
             let lang = language.to_uppercase();
             let lsize = 11.0 * s;
-            let lw = text_width(font, lsize, &lang);
+            let mut lw = text_width(font, lsize, &lang);
             let right = w - 18.0 * s;
             c.text(font, lsize, right - lw, mid + 4.0 * s, &lang, colors.muted);
+            if *agent {
+                let tag = if *fresh { "NEW AI" } else { "AI" };
+                let tw = text_width(font, lsize, tag);
+                c.text(
+                    font,
+                    lsize,
+                    right - lw - 6.0 * s - tw,
+                    mid + 4.0 * s,
+                    tag,
+                    colors.accent,
+                );
+                lw += 6.0 * s + tw;
+            }
             c.text(
                 font,
                 size,
@@ -288,7 +369,7 @@ pub fn render(
                 c.rounded_rect(16.0 * s, h - 6.0 * s, 12.0 * s, 2.0 * s, 1.0 * s, col);
             }
         }
-        View::Transcribing { phase } => {
+        View::Transcribing { phase } | View::Sending { phase } => {
             for i in 0..3 {
                 let t = (phase * 2.2 - i as f32 * 0.22).rem_euclid(1.0);
                 let lift = (t * std::f32::consts::PI).sin().max(0.0);
@@ -301,20 +382,69 @@ pub fn render(
                     col,
                 );
             }
-            c.text(
-                font,
-                15.0 * s,
-                62.0 * s,
-                mid + 5.5 * s,
-                "Transcribing…",
-                colors.fg,
-            );
+            let label = if matches!(view, View::Sending { .. }) {
+                "Sending to opencode…"
+            } else {
+                "Transcribing…"
+            };
+            c.text(font, 15.0 * s, 62.0 * s, mid + 5.5 * s, label, colors.fg);
         }
+        View::Confirm { .. } => {}
         View::Message { text, error } => {
             let dot = if *error { colors.red } else { colors.accent };
             c.circle(22.0 * s, mid, 5.0 * s, dot);
             c.text(font, 15.0 * s, 38.0 * s, mid + 5.5 * s, text, colors.fg);
         }
+    }
+    c
+}
+
+/// The agent's confirmation box: who it goes to, the transcript (up to four
+/// lines), the keys, and a bar that runs out when it sends by itself.
+fn render_confirm(
+    text: &str,
+    left: f32,
+    fresh: bool,
+    colors: &Colors,
+    font: &FontArc,
+    s: f32,
+) -> Canvas {
+    let w = (460.0 * s).round();
+    let pad = 18.0 * s;
+    let size = 15.0 * s;
+    let line_h = 21.0 * s;
+    let lines = wrap(font, size, text, w - 2.0 * pad, 4);
+    let h =
+        (pad + 16.0 * s + 8.0 * s + line_h * lines.len().max(1) as f32 + 12.0 * s + 14.0 * s + pad)
+            .round();
+    let mut c = Canvas::new(w as usize, h as usize);
+    let r = 14.0 * s;
+    c.rounded_rect(0.0, 0.0, w, h, r, colors.border);
+    c.rounded_rect(1.0 * s, 1.0 * s, w - 2.0 * s, h - 2.0 * s, r - s, colors.bg);
+    let small = 12.0 * s;
+    let mut y = pad + 11.0 * s;
+    c.circle(pad + 4.0 * s, y - 4.0 * s, 4.0 * s, colors.accent);
+    let title = if fresh {
+        "To opencode · new conversation"
+    } else {
+        "To opencode"
+    };
+    c.text(font, small, pad + 14.0 * s, y, title, colors.muted);
+    y += 8.0 * s;
+    for line in &lines {
+        y += line_h;
+        c.text(font, size, pad, y - 5.0 * s, line, colors.fg);
+    }
+    y += 12.0 * s;
+    let hint = "Enter sends now · Esc cancels";
+    c.text(font, small, pad, y + 6.0 * s, hint, colors.muted);
+    // The countdown: a thin bar along the bottom edge.
+    let bar_w = (w - 2.0 * pad) * left.clamp(0.0, 1.0);
+    let mut track = colors.muted;
+    track[3] = 0.25;
+    c.rounded_rect(pad, h - 9.0 * s, w - 2.0 * pad, 3.0 * s, 1.5 * s, track);
+    if bar_w > 0.5 {
+        c.rounded_rect(pad, h - 9.0 * s, bar_w, 3.0 * s, 1.5 * s, colors.accent);
     }
     c
 }
@@ -605,8 +735,19 @@ mod tests {
                 levels: vec![0.2, 0.9, 0.5],
                 language: "sv".into(),
                 holding: true,
+                agent: false,
+                fresh: false,
+            },
+            View::Recording {
+                seconds: 3.0,
+                levels: vec![0.4],
+                language: "sv".into(),
+                holding: false,
+                agent: true,
+                fresh: true,
             },
             View::Transcribing { phase: 0.3 },
+            View::Sending { phase: 0.6 },
             View::Message {
                 text: "No Swedish model installed".into(),
                 error: true,
@@ -619,6 +760,47 @@ mod tests {
             assert!(c.px[c.w * (c.h / 2) + c.w / 2][3] > 0.9);
             assert_eq!(c.bytes(false).len(), c.w * c.h * 4);
         }
+    }
+
+    #[test]
+    fn the_confirm_box_wraps_and_counts_down() {
+        let font = font(None);
+        let p = palette();
+        let short = render(
+            &View::Confirm {
+                text: "Hej".into(),
+                left: 1.0,
+                fresh: false,
+            },
+            &p,
+            &font,
+            1.0,
+            true,
+        );
+        let long_text = "Kan du titta på varför bygget misslyckas i nirubar och föreslå en ändring som gör testerna gröna igen utan att ändra beteendet för användaren, och sedan skriva en kort sammanfattning av vad du gjorde och varför det behövdes.".repeat(2);
+        let long = render(
+            &View::Confirm {
+                text: long_text.clone(),
+                left: 0.5,
+                fresh: true,
+            },
+            &p,
+            &font,
+            1.0,
+            true,
+        );
+        assert_eq!(short.w, 460);
+        assert!(long.h > short.h, "more lines, taller box");
+        assert!(long.h < 260, "at most four lines");
+        let lines = wrap(&font, 15.0, &long_text, 424.0, 4);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[3].ends_with('…'));
+        assert!(lines.iter().all(|l| text_width(&font, 15.0, l) <= 424.0));
+        assert_eq!(wrap(&font, 15.0, "ett två", 424.0, 4), ["ett två"]);
+        assert!(wrap(&font, 15.0, "", 424.0, 4).is_empty());
+        let one = wrap(&font, 15.0, &"x".repeat(400), 100.0, 4);
+        assert_eq!(one.len(), 1);
+        assert!(one[0].ends_with('…'));
     }
 
     #[test]

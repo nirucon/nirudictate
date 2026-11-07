@@ -1,6 +1,6 @@
 # NIRUDICTATE
 
-Local speech-to-text dictation: press Ctrl+Alt+Space, speak, and the text appears where you type.
+Local speech-to-text dictation: press Ctrl+Alt+Space, speak, and the text appears where you type. Press Shift+Alt+Space instead to talk to the opencode agent.
 
 **Status: alpha** · Part of the [NIRUX](https://github.com/nirucon/nirux) suite · [MIT License](LICENSE)
 
@@ -19,6 +19,9 @@ other X11 desktops.
 - **Swedish first.** Swedish uses [KB-Whisper](https://huggingface.co/KBLab)
   from KBLab, the National Library of Sweden's data lab, trained on 50 000 hours
   of Swedish. English uses OpenAI's Whisper.
+- **Talk to an agent.** Shift+Alt+Space sends what you say to
+  [opencode](https://opencode.ai) instead of typing it. The opencode window
+  lives in NIRUWM scratchpad 9 and comes to the front with each message.
 - **Out of the way.** A small overlay at the bottom of the screen while you
   speak and a red dot in NIRUBAR, nothing else. The background service uses no
   CPU while idle, opens the microphone only while you dictate, and frees the
@@ -52,6 +55,10 @@ take the paste, the text is typed instead. See
 - NIRUX integration: NIRUBAR `dictation` module, `dictation` sound category,
   started by the NIRUX session.
 - Checksum-verified, resumable model downloads.
+- Agent mode (`Shift+Alt+Space`): local transcription, a short confirmation,
+  then the text goes to opencode through its own server API, in one ongoing
+  conversation (a double tap starts a new one). See
+  [Agent mode](#agent-mode-opencode).
 
 ### Privacy
 
@@ -66,6 +73,10 @@ take the paste, the text is typed instead. See
 - The microphone is opened only while you dictate: the recorder process
   exists only then, so PipeWire shows NIRUDICTATE as a recording client only
   while the red dot is on.
+- Agent mode is the one exception to "nothing leaves this computer": the
+  speech is still transcribed locally, but the *text* you confirm is handed to
+  opencode, which sends it to the AI provider that opencode is set up to use.
+  Nothing is sent when you press Esc in the confirmation box.
 
 ## Requirements
 
@@ -73,6 +84,10 @@ take the paste, the text is typed instead. See
 - X11 (NIRUWM or any other X11 desktop) with XTest.
 - OpenGL and `libxkbcommon-x11` for the panel (every NIRUX install has them).
 - A recorder: `pw-record` (PipeWire), or `parec`/`arecord` without PipeWire.
+- Agent mode only: [opencode](https://opencode.ai) 1.x or 2.x with a provider
+  set up, and a terminal (kitty, alacritty or xterm). NIRUWM 0.17.9 or newer
+  keeps the opencode window in scratchpad 9; with an older window manager it
+  opens as a normal window.
 
 | Distribution | Package with the recorder |
 |---|---|
@@ -123,6 +138,46 @@ The installer puts `nirudictate` in `~/.local/bin`, a launcher entry in
    pause. The text is inserted.
 
 If you press the shortcut before a model is installed, the panel opens by itself.
+
+### Agent mode (opencode)
+
+**Shift+Alt+Space** works like the dictation shortcut (tap to start and it
+stops after a pause, or hold while you speak), but the text goes to
+[opencode](https://opencode.ai) instead of the window you type in:
+
+1. You speak; the speech is transcribed on this computer as usual. The
+   overlay shows **AI** next to the language while it records.
+2. A small box at the bottom of the screen shows the text. It **sends by
+   itself after 2 seconds**; **Enter** sends at once, **Esc** cancels and
+   nothing is sent.
+3. NIRUDICTATE hands the text to opencode through opencode's own server API
+   (not by typing into a window, and never on a command line). The opencode
+   window, in **NIRUWM scratchpad 9** (**Super+Alt+9**), comes to the front
+   and shows the answer.
+
+- **One ongoing conversation.** Every message continues the same opencode
+  session, also after a restart. **Tap the shortcut twice quickly** (the
+  overlay shows **NEW AI**) or press **Start a new conversation** in the panel
+  (or `nirudictate agent new`) to begin a new one.
+- **The window.** NIRUDICTATE starts its own opencode server on 127.0.0.1
+  with a random password (passed only in the environment) and an opencode TUI
+  attached to it in a terminal in scratchpad 9. Hide it with Super+Alt+9 like
+  any scratchpad. Closing it stops the server; the next message opens both
+  again and continues the conversation. Slot 9 is reserved for it: a window
+  you had sent to slot 9 yourself goes back to the workspace.
+- **Agent and permissions.** opencode's default agent is used unless you name
+  one; nothing is approved automatically (no `--auto`), so opencode asks in
+  its window as usual before it edits files or runs commands.
+- **Working folder.** opencode works in your home folder (`~`) unless you
+  choose another one.
+- **Both opencode generations.** opencode 1.x (`serve`, `attach`,
+  `/session/…/prompt_async`) and 2.x (`--server`, `/api/session/…/prompt`).
+- **Without opencode** the agent shortcut is not taken at all and `doctor`
+  says why.
+- `nirudictate doctor` also warns when the agent shortcut clashes with a
+  keyboard-layout switch such as the XKB option `grp:alt_shift_toggle`
+  (Alt+Shift changes the layout); choose another agent shortcut in the panel
+  or drop the option.
 
 ### Shortcut and modes
 
@@ -181,8 +236,8 @@ code; a file that does not match is deleted.
 ### The control panel
 
 `nirudictate settings [TAB]` opens the panel (tabs: `overview`, `models`,
-`shortcut`, `output`, `vocabulary`, `history`, `advanced`). Every change is
-saved at once.
+`shortcut`, `agent`, `output`, `vocabulary`, `history`, `advanced`). Every
+change is saved at once.
 
 - **Overview** — status, the language, the model, the shortcut; a microphone
   test that transcribes without inserting anything; the last dictation.
@@ -190,6 +245,10 @@ saved at once.
   sizes, the expected time on this computer and the recommendation.
 - **Shortcut & Mode** — record a new shortcut, choose the mode, the hold
   time, the silence period and the longest dictation.
+- **Agent mode** — whether opencode was found, turn agent mode on or off, its
+  shortcut, the double tap, the confirmation time, the working folder, the
+  opencode agent, the terminal, **Start a new conversation** and **Show
+  opencode**.
 - **Output** — paste or type, restore the clipboard, capital letter, trailing
   space, extra terminal classes, overlay and sounds.
 - **Vocabulary** — words the model should prefer (names, products, jargon).
@@ -214,7 +273,13 @@ nirudictate models delete ID
 nirudictate models verify ID    check a model against its checksum
 nirudictate transcribe FILE.wav [--model ID]
 nirudictate bench FILE.wav [ID…]
-nirudictate doctor              check display, XTest, audio, models, shortcut
+nirudictate agent [status]      agent mode: opencode, window, conversation [--json]
+nirudictate agent toggle        start/stop a dictation for opencode
+nirudictate agent new           the next message starts a new conversation
+nirudictate agent show          show the opencode window (scratchpad 9)
+nirudictate agent send          send the text in the confirmation box now
+nirudictate agent file FILE.wav transcribe a WAV and send it like speech
+nirudictate doctor              check display, XTest, audio, models, shortcuts, opencode
 nirudictate reload              re-read config.toml
 nirudictate unload              free the loaded model now
 nirudictate daemon              run the service in the foreground
@@ -223,7 +288,7 @@ nirudictate quit                stop the service
 ```
 
 `status --json` is a stable machine-readable form (`state`, `language`,
-`model`, `loaded`, `shortcut_active`, `last`, `error`, …).
+`model`, `loaded`, `shortcut_active`, `last`, `error`, `agent`, …).
 
 ## Configuration
 
@@ -270,6 +335,16 @@ threads = 0              # 0 = one per physical core (at most 8, one core kept f
 keep_model_loaded = false
 unload_after_minutes = 10
 nice = 10                # transcription priority (0–19)
+
+[agent]
+enabled = true           # agent mode, when opencode is installed
+key = "shift+alt+space"  # same modes as [shortcut]
+directory = "~"          # the folder opencode works in
+agent = ""               # an opencode agent name; empty = opencode's default agent
+confirm_seconds = 2.0    # the box sends by itself after this (0 = no box)
+double_tap_new = true    # a quick double tap starts a new conversation
+terminal = "auto"        # "auto" (kitty, alacritty, xterm) or one of them
+opencode = ""            # path to opencode; empty = PATH, ~/.opencode/bin, ~/.local/bin
 ```
 
 ### Sounds
@@ -283,10 +358,10 @@ Without NIRUX dictation is silent.
 ### Status bars
 
 NIRUBAR's `dictation` module shows a red dot while recording and a different
-mark while transcribing. Other bars can read
-`$XDG_RUNTIME_DIR/nirudictate/state.json`
+mark while transcribing, followed by `AI` in agent mode (NIRUBAR 0.18.90).
+Other bars can read `$XDG_RUNTIME_DIR/nirudictate/state.json`
 (`{"version":1,"state":"recording","pid":…,"pid_start":…,"since":…,"language":"sv"}`,
-replaced atomically on every change) or watch the root window property
+plus `"target":"agent"` in agent mode; replaced atomically on every change) or watch the root window property
 `_NIRUDICTATE_STATE`; `nirudictate state` prints the word.
 
 ## Files and paths
@@ -298,6 +373,7 @@ replaced atomically on every change) or watch the root window property
 | `~/.config/nirudictate/config.toml` | Settings (0600) |
 | `~/.local/share/nirudictate/models/` | Downloaded models |
 | `~/.local/state/nirudictate/history.jsonl` | Dictation history (0600) |
+| `~/.local/state/nirudictate/agent.json` | Agent mode: the ongoing opencode session (0600) |
 | `~/.local/state/nirudictate/daemon.log` | Service log when started by the panel or installer |
 | `~/.local/state/niruwm/nirudictate.log` | Service log when started by the NIRUX session |
 | `$XDG_RUNTIME_DIR/nirudictate/state.json` | Live state for bars |
@@ -322,6 +398,15 @@ Start with `nirudictate doctor`.
 - **Transcription is slow.** Use a smaller model (the panel shows the measured
   time), or set Advanced → Threads higher. Laptops on battery are slower.
 - **Wrong words for names.** Add them under Vocabulary.
+- **Shift+Alt+Space does nothing.** `nirudictate agent status` says whether
+  opencode was found and the shortcut is active. Without opencode agent mode
+  is off. If the keyboard layout changes when you press it, the XKB option
+  `grp:alt_shift_toggle` (or a similar one) uses Alt+Shift; `doctor` names it.
+- **The opencode window is a normal window, not scratchpad 9.** The window
+  manager is older than NIRUWM 0.17.9; log out and in after `nirux update`.
+- **opencode answers "not authenticated" or picks the wrong model.** Set
+  opencode up once in a terminal (`opencode auth login`, `opencode models`);
+  agent mode uses opencode's own configuration.
 - **Logs.** The service logs each dictation (model, time, how the text was
   inserted; never the text) to `~/.local/state/niruwm/nirudictate.log` when
   the NIRUX session started it, and to `~/.local/state/nirudictate/daemon.log`

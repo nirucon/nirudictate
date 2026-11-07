@@ -26,7 +26,31 @@ pub enum Request {
         path: String,
         model: Option<String>,
     },
+    /// Agent mode: start/stop a dictation for opencode (Shift+Alt+Space).
+    AgentToggle,
+    /// The next agent message starts a new opencode conversation.
+    AgentNew,
+    /// Show the opencode window (scratchpad slot 9).
+    AgentShow,
+    /// Send the transcript in the confirmation box now.
+    AgentSend,
+    /// Transcribe a WAV file and send it to opencode like a spoken message
+    /// (with the confirmation box); for tests without a microphone.
+    AgentFile {
+        path: String,
+    },
     Quit,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AgentStatus {
+    pub enabled: bool,
+    pub shortcut: String,
+    pub shortcut_active: bool,
+    /// Why agent mode is off or the shortcut is not grabbed.
+    pub problem: Option<String>,
+    #[serde(flatten)]
+    pub info: crate::agent::Info,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -58,6 +82,9 @@ pub struct Status {
     pub engine: String,
     pub last: Option<LastResult>,
     pub error: Option<String>,
+    /// Agent mode (0.2); absent from older services.
+    #[serde(default)]
+    pub agent: Option<AgentStatus>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -138,5 +165,21 @@ mod tests {
                 language: "en".into()
             }
         );
+        assert_eq!(
+            serde_json::to_string(&Request::AgentToggle).unwrap(),
+            r#"{"cmd":"agent-toggle"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"cmd":"agent-file","path":"/a.wav"}"#).unwrap(),
+            Request::AgentFile {
+                path: "/a.wav".into()
+            }
+        );
+        // A 0.1 status (no agent field) still reads.
+        let old: Status = serde_json::from_str(
+            r#"{"version":"0.1.0","state":"idle","pid":1,"language":"sv","model":null,"loaded":null,"recording_seconds":0.0,"shortcut":"ctrl+alt+space","shortcut_active":true,"mode":"hybrid","audio":"pw-record","engine":"x","last":null,"error":null}"#,
+        )
+        .unwrap();
+        assert!(old.agent.is_none());
     }
 }

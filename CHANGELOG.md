@@ -1,3 +1,46 @@
+# NIRUDICTATE 0.2.0
+
+Agent mode: talk to [opencode](https://opencode.ai).
+
+- **Shift+Alt+Space** records like the dictation shortcut (tap to start, it
+  stops after a pause or a second tap; hold to talk), transcribes locally,
+  and sends the text to opencode instead of pasting it.
+- A small themed **confirmation box** shows the text and **sends it by itself
+  after 2 s**; **Enter** sends at once, **Esc** cancels (nothing is sent).
+- Delivery goes through opencode's **server API**: NIRUDICTATE starts its own
+  `opencode serve` on 127.0.0.1 with a random password that travels only in
+  the environment. No keystrokes are injected and the message never appears
+  in a command line.
+- **One ongoing conversation**, kept across restarts
+  (`~/.local/state/nirudictate/agent.json`). A **quick double tap** of the
+  shortcut, **Start a new conversation** in the panel or
+  `nirudictate agent new` begins a new one.
+- The opencode TUI runs attached to that server in a terminal (kitty,
+  alacritty or xterm) that always lives in **NIRUWM scratchpad 9**
+  (Super+Alt+9). It is started when it is missing and shown on top with each
+  message. Closing it stops its server. Needs NIRUWM 0.17.9 (`niructl
+  scratchpad send N --window ID`); older window managers get a normal window.
+- opencode's **default agent** unless `[agent] agent` names one; permissions
+  are never auto-approved (no `--auto`). Working folder `~` by default.
+- Both **opencode 1.x** (yargs CLI: `serve`, `attach --session`,
+  `/session/ID/prompt_async`) and **2.x** (`--server`, `--session`,
+  `/api/session/ID/prompt`).
+- **Without opencode** the agent shortcut is not grabbed; `status`, the panel
+  and `doctor` say so.
+- `doctor` warns when the agent shortcut clashes with an XKB layout switch
+  such as `grp:alt_shift_toggle`, and checks opencode, the folder and the
+  agent shortcut grab.
+- New panel tab **Agent mode**; new `[agent]` settings (`enabled`, `key`,
+  `directory`, `agent`, `confirm_seconds`, `double_tap_new`, `terminal`,
+  `opencode`). 0.1 config files load unchanged.
+- New CLI: `nirudictate agent [status|toggle|new|show|send|file FILE.wav]`.
+- The overlay shows **AI** (and **NEW AI** for a new conversation) while it
+  records for the agent, and "Sending to opencode…".
+- Live state: `state.json` gains `"target":"agent"` during an agent
+  dictation (still `version: 1`; NIRUBAR 0.18.90 shows `● AI`). `status
+  --json` gains an `agent` object.
+- Speaking the reply aloud (Piper TTS) is left for a later release.
+
 # NIRUDICTATE 0.1.0
 
 First release: local speech-to-text dictation for the NIRUX desktop (X11).

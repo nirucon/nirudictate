@@ -71,3 +71,27 @@ nirudictate status --json
 nirudictate transcribe file.wav    # through the running service
 nirudictate bench file.wav sv-base sv-small
 ```
+
+## Agent mode (0.2.0)
+
+- Unit tests: version parsing for both opencode styles, the request paths and
+  bodies of both APIs (default agent unless configured), the TUI command lines
+  (no `--auto`, no password), terminal choice and class, basic auth, the
+  scratchpad property, XKB conflicts, the double tap, the confirmation box
+  wrapping, config defaults and validation, and the IPC wire form.
+- Isolated Xvfb on othala (`:57`, the release NIRUWM 0.17.9 build with
+  bar and wallpaper off, kitty, the real opencode 1.19.0 and its configured
+  provider): `nirudictate agent file speech.wav` with a WAV made with the
+  system libflite (`cmu_us_slt`) → confirmation box → auto-send after 2 s →
+  the default `build` agent answers in the TUI in scratchpad 9; Esc cancels
+  (nothing sent); Enter sends at once; a double tap of Shift+Alt+Space shows
+  NEW AI; holding it records for the agent; `agent new` starts a new
+  session and the TUI follows it; hiding and `agent show`; closing the TUI
+  stops the server and the next message continues the same session; doctor
+  with and without an XKB `grp:alt_shift_toggle` clash; a missing opencode
+  leaves the key ungrabbed; quitting stops server and TUI.
+- opencode 2.x was checked against its source (tag v2.1.3: `serve`,
+  `--server`, `--session`, `/api/session`, `/api/session/ID/prompt`,
+  `/api/info`, `OPENCODE_PASSWORD`) and `--help` on a 2.1.3 install; it was not
+  run end to end.
+

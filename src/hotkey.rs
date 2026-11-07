@@ -115,7 +115,13 @@ pub enum Action {
     None,
     Start,
     Stop,
+    /// A second tap right after a tap that started recording: keep
+    /// recording, for a new agent conversation.
+    DoubleTap,
 }
+
+/// Two taps closer together than this are a double tap.
+pub const DOUBLE_TAP: Duration = Duration::from_millis(450);
 
 /// Press/release interpretation. Pure, so every mode is unit tested.
 #[derive(Debug)]
@@ -124,6 +130,8 @@ pub struct Controller {
     pub hold: Duration,
     recording: bool,
     pressed_at: Option<Instant>,
+    /// When the recording started with a press, for double taps.
+    started_at: Option<Instant>,
     /// The release that belongs to a stopping press.
     swallow_release: bool,
 }
@@ -135,6 +143,7 @@ impl Controller {
             hold,
             recording: false,
             pressed_at: None,
+            started_at: None,
             swallow_release: false,
         }
     }
@@ -143,16 +152,28 @@ impl Controller {
     pub fn reset(&mut self) {
         self.recording = false;
         self.pressed_at = None;
+        self.started_at = None;
     }
 
     /// A recording started outside the key (CLI `start`): a later press stops it.
     pub fn started_elsewhere(&mut self) {
         self.recording = true;
         self.pressed_at = None;
+        self.started_at = None;
     }
 
-    pub fn press(&mut self, now: Instant, busy: bool) -> Action {
+    /// `double`: a quick second tap means `DoubleTap` instead of stop
+    /// (the agent shortcut in hybrid and toggle mode).
+    pub fn press(&mut self, now: Instant, busy: bool, double: bool) -> Action {
         if self.recording {
+            let quick = self
+                .started_at
+                .is_some_and(|t| now.saturating_duration_since(t) < DOUBLE_TAP);
+            if double && quick && self.pressed_at.is_none() && self.mode != Mode::Hold {
+                self.started_at = None;
+                self.swallow_release = true;
+                return Action::DoubleTap;
+            }
             // Hold mode stops on release; a second press while held is noise.
             if self.mode == Mode::Hold && self.pressed_at.is_some() {
                 return Action::None;
@@ -168,6 +189,7 @@ impl Controller {
         }
         self.recording = true;
         self.pressed_at = Some(now);
+        self.started_at = Some(now);
         self.swallow_release = false;
         Action::Start
     }
@@ -241,14 +263,14 @@ mod tests {
         let t = Instant::now();
         let mut c = Controller::new(Mode::Hybrid, Duration::from_millis(350));
         // Tap: starts and keeps recording.
-        assert_eq!(c.press(t, false), Action::Start);
+        assert_eq!(c.press(t, false, false), Action::Start);
         assert_eq!(c.release(at(t, 120)), Action::None);
         assert!(!c.holding());
         // Second press stops; its release is swallowed.
-        assert_eq!(c.press(at(t, 3000), false), Action::Stop);
+        assert_eq!(c.press(at(t, 3000), false, false), Action::Stop);
         assert_eq!(c.release(at(t, 3100)), Action::None);
         // Hold: stops on release.
-        assert_eq!(c.press(at(t, 5000), false), Action::Start);
+        assert_eq!(c.press(at(t, 5000), false, false), Action::Start);
         assert!(c.holding());
         assert_eq!(c.release(at(t, 7000)), Action::Stop);
     }
@@ -257,9 +279,9 @@ mod tests {
     fn toggle_ignores_releases() {
         let t = Instant::now();
         let mut c = Controller::new(Mode::Toggle, Duration::from_millis(350));
-        assert_eq!(c.press(t, false), Action::Start);
+        assert_eq!(c.press(t, false, false), Action::Start);
         assert_eq!(c.release(at(t, 2000)), Action::None);
-        assert_eq!(c.press(at(t, 4000), false), Action::Stop);
+        assert_eq!(c.press(at(t, 4000), false, false), Action::Stop);
         assert_eq!(c.release(at(t, 4100)), Action::None);
     }
 
@@ -267,8 +289,8 @@ mod tests {
     fn hold_mode_stops_on_release_only() {
         let t = Instant::now();
         let mut c = Controller::new(Mode::Hold, Duration::from_millis(350));
-        assert_eq!(c.press(t, false), Action::Start);
-        assert_eq!(c.press(at(t, 10), false), Action::None);
+        assert_eq!(c.press(t, false, false), Action::Start);
+        assert_eq!(c.press(at(t, 10), false, false), Action::None);
         assert_eq!(c.release(at(t, 50)), Action::Stop);
     }
 
@@ -276,18 +298,43 @@ mod tests {
     fn a_press_while_transcribing_does_nothing() {
         let t = Instant::now();
         let mut c = Controller::new(Mode::Hybrid, Duration::from_millis(350));
-        assert_eq!(c.press(t, true), Action::None);
+        assert_eq!(c.press(t, true, false), Action::None);
         assert_eq!(c.release(at(t, 900)), Action::None);
-        assert_eq!(c.press(at(t, 1000), false), Action::Start);
+        assert_eq!(c.press(at(t, 1000), false, false), Action::Start);
     }
 
     #[test]
     fn silence_stop_resets_the_controller() {
         let t = Instant::now();
         let mut c = Controller::new(Mode::Hybrid, Duration::from_millis(350));
-        assert_eq!(c.press(t, false), Action::Start);
+        assert_eq!(c.press(t, false, false), Action::Start);
         assert_eq!(c.release(at(t, 100)), Action::None);
         c.reset();
-        assert_eq!(c.press(at(t, 5000), false), Action::Start);
+        assert_eq!(c.press(at(t, 5000), false, false), Action::Start);
+    }
+
+    #[test]
+    fn a_quick_second_tap_is_a_double_tap_for_the_agent() {
+        let t = Instant::now();
+        let mut c = Controller::new(Mode::Hybrid, Duration::from_millis(350));
+        assert_eq!(c.press(t, false, true), Action::Start);
+        assert_eq!(c.release(at(t, 90)), Action::None);
+        // Second tap within 450 ms: keep recording, new conversation.
+        assert_eq!(c.press(at(t, 250), false, true), Action::DoubleTap);
+        assert_eq!(c.release(at(t, 320)), Action::None);
+        // A third tap stops as usual.
+        assert_eq!(c.press(at(t, 400), false, true), Action::Stop);
+        // A slow second tap stops.
+        assert_eq!(c.press(at(t, 5000), false, true), Action::Start);
+        assert_eq!(c.release(at(t, 5080)), Action::None);
+        assert_eq!(c.press(at(t, 5600), false, true), Action::Stop);
+        // Without `double` a quick second tap stops, as before.
+        assert_eq!(c.press(at(t, 9000), false, false), Action::Start);
+        assert_eq!(c.release(at(t, 9080)), Action::None);
+        assert_eq!(c.press(at(t, 9200), false, false), Action::Stop);
+        // Push-to-talk mode has no double tap.
+        let mut h = Controller::new(Mode::Hold, Duration::from_millis(350));
+        assert_eq!(h.press(t, false, true), Action::Start);
+        assert_eq!(h.release(at(t, 90)), Action::Stop);
     }
 }

@@ -8,7 +8,11 @@ state, protocols) and `docs/TESTING.md` (how it was verified) first.
 
 - **Local only.** The network is used for model downloads and nothing else.
   Every model URL is pinned to a Hugging Face commit and every file to its
-  SHA-256 (`src/models.rs`). Never log or upload audio or text.
+  SHA-256 (`src/models.rs`). Never log or upload audio or text. The one
+  exception is agent mode (`src/agent.rs`): the text the user confirmed goes
+  to the local opencode server on 127.0.0.1, which talks to the user's AI
+  provider. Its password stays in the environment of the server and the TUI;
+  never put it, or the message, in argv or a log, and never pass `--auto`.
 - **Idle is free.** While idle the service sleeps in one `poll` with no
   timeout: no microphone, no model, no timers, no animation. The microphone is
   a child process that exists only while recording; the model is loaded on
@@ -29,6 +33,9 @@ state, protocols) and `docs/TESTING.md` (how it was verified) first.
   `~/.local/share/nirudictate/models/`, history and measurements
   `~/.local/state/nirudictate/` (0600), socket and live state
   `$XDG_RUNTIME_DIR/nirudictate/`.
+- Agent mode keeps opencode in NIRUWM scratchpad slot 9 through
+  `_NIRUWM_COMMAND` 18 (a named window, not the focused one); never send the
+  focused window anywhere.
 - The live state file (`state.json`) and the root property
   `_NIRUDICTATE_STATE` are a public contract for NIRUBAR; keep them
   compatible (`version: 1`).

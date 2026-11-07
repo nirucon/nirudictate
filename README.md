@@ -137,11 +137,6 @@ and the language; a thin red line marks push-to-talk. While transcribing it
 shows three moving dots. A dictation that hears nothing is discarded
 ("Nothing heard"). The longest dictation is 2 minutes by default.
 
-While recording, the overlay shows a pulsing red dot, a level meter, the time
-and the language; a thin red line marks push-to-talk. While transcribing it
-shows three moving dots. A dictation that hears nothing is discarded
-("Nothing heard"). The longest dictation is 2 minutes by default.
-
 ### Languages and models
 
 The panel recommends the largest model that is fast enough on this computer
@@ -339,10 +334,8 @@ Start with `nirudictate doctor`.
 ./uninstall.sh --purge  # removes those too
 ```
 
-With NIRUX: `nirux extras unselect nirudictate`, then run the uninstaller from a
-checkout (or delete `~/.local/bin/nirudictate`, `~/.local/lib/nirudictate`,
-`~/.local/share/applications/nirudictate.desktop` and
-`~/.config/autostart/nirudictate.desktop`).
+With NIRUX: `nirux extras uninstall nirudictate` (add `--purge` to remove
+settings, history and models too).
 
 ## Building from source
 

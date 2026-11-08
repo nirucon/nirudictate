@@ -597,6 +597,12 @@ impl Daemon {
             problem
         };
         let _ = self.conn.flush();
+        // The cheat sheet (Super+/) lists the keys this service really uses.
+        let agent_in_use =
+            self.cfg.agent.enabled && agent::find(&self.cfg.agent.opencode).is_some();
+        if let Err(e) = crate::keysd::write(&self.cfg, agent_in_use) {
+            eprintln!("nirudictate: {e}");
+        }
     }
 
     /// Escape and Enter for the confirmation box, only while it is shown.

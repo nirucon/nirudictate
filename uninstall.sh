@@ -9,7 +9,8 @@ STATE="${XDG_STATE_HOME:-$HOME/.local/state}"
 rm -f "$BIN" "$HOME/.local/lib/nirudictate/nirudictate-baseline" \
   "$DATA/applications/nirudictate.desktop" \
   "$DATA/icons/hicolor/scalable/apps/nirudictate.svg" \
-  "$CONFIG/autostart/nirudictate.desktop"
+  "$CONFIG/autostart/nirudictate.desktop" \
+  "$DATA/niru/keys.d/nirudictate.toml"
 rmdir "$HOME/.local/lib/nirudictate" 2>/dev/null || :
 if [ "${1:-}" = "--purge" ]; then
   rm -rf "$CONFIG/nirudictate" "$STATE/nirudictate" "$DATA/nirudictate"

@@ -29,7 +29,9 @@ jobs:
       - name: Tests
         run: cargo test --locked
       - name: Shell scripts
-        run: bash -n install.sh uninstall.sh && shellcheck -S warning install.sh uninstall.sh
+        run: bash -n install.sh uninstall.sh && shellcheck -S warning install.sh uninstall.sh tests/uninstall-keysd.sh
+      - name: Uninstall removes the cheat-sheet file
+        run: bash tests/uninstall-keysd.sh
 
   msrv:
     # whisper-rs needs Rust 1.88; the lockfile must build unchanged on it.

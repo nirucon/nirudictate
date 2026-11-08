@@ -378,6 +378,7 @@ plus `"target":"agent"` in agent mode; replaced atomically on every change) or w
 | `~/.local/state/niruwm/nirudictate.log` | Service log when started by the NIRUX session |
 | `$XDG_RUNTIME_DIR/nirudictate/state.json` | Live state for bars |
 | `~/.config/autostart/nirudictate.desktop` | XDG autostart entry (other desktops) |
+| `~/.local/share/niru/keys.d/nirudictate.toml` | The shortcuts, for NIRUWM's cheat sheet (Super+/); rewritten from the settings when the service starts, removed by uninstall |
 
 ## Troubleshooting
 

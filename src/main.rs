@@ -9,6 +9,7 @@ mod history;
 mod hotkey;
 mod insert;
 mod ipc;
+mod keysd;
 mod live;
 mod measure;
 mod models;

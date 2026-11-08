@@ -1,3 +1,17 @@
+# NIRUDICTATE 0.2.1
+
+- **Cheat sheet registration.** The service writes
+  `~/.local/share/niru/keys.d/nirudictate.toml` (`$XDG_DATA_HOME`) from the
+  shortcuts it really uses, each time it starts or reloads its settings. NIRUWM
+  0.18's cheat sheet (Super+/) lists them under *Dictation* and flags clashes.
+  The agent key is listed only while agent mode is on and opencode is
+  installed. The file is rewritten only when it changes.
+- Keys are written in NIRUWM's `[[keys]]` syntax; a key NIRUWM has no name for
+  (Insert, Home, …) is left out instead of making the file invalid.
+- `uninstall.sh` (and `nirux extras uninstall nirudictate`) removes the file.
+- Tests: key syntax, file content per setting, write mode; a shell test that
+  uninstall removes the file and leaves other programs' files.
+
 # NIRUDICTATE 0.2.0
 
 Agent mode: talk to [opencode](https://opencode.ai).

@@ -96,7 +96,7 @@ take the paste, the text is typed instead. See
 | Void | `pipewire` (or `pulseaudio-utils`, `alsa-utils`) |
 
 The release contains two whisper.cpp builds, one for CPUs with AVX2 and FMA
-(most x86_64 computers since 2013–2015) and a baseline one for older CPUs;
+(most x86_64 computers since 2013 to 2015) and a baseline one for older CPUs;
 NIRUDICTATE picks the right one when it starts.
 
 ## Installation
@@ -111,7 +111,8 @@ nirux extras update            # later, for the extras you selected
 NIRUX downloads the pinned, checksum-verified release, installs it in
 `~/.local` and starts the service in your running session. The NIRUX session
 (NIRUWM 0.17.3 or newer) starts the service at every login on Debian, Arch and
-Void alike, without systemd user units.
+Void alike, without systemd user units. In NIRUX, `nirux manual nirudictate`
+opens the short tour in the NIRUX manual.
 
 ### Standalone
 
@@ -198,7 +199,7 @@ The panel recommends the largest model that is fast enough on this computer
 (about 3.5 s or less per dictation), from its cores, vector instructions and
 memory; after a few dictations it uses the speed it actually measured.
 
-**Swedish — KB-Whisper** (8-bit, converted for NIRUDICTATE, see below)
+**Swedish: KB-Whisper** (8-bit, converted for NIRUDICTATE, see below)
 
 | Model | Download | Memory | Time per dictation on a 6-core Xeon W-1250 |
 |---|---|---|---|
@@ -208,7 +209,7 @@ memory; after a few dictations it uses the speed it actually measured.
 | Medium | 823 MB | ~1.1 GB | 8.9 s |
 | Large | 1.66 GB | ~2.1 GB | 17 s |
 
-**English — OpenAI Whisper** (whisper.cpp 8-bit files)
+**English: OpenAI Whisper** (whisper.cpp 8-bit files)
 
 | Model | Download | Time on the same computer |
 |---|---|---|
@@ -239,21 +240,21 @@ code; a file that does not match is deleted.
 `shortcut`, `agent`, `output`, `vocabulary`, `history`, `advanced`). Every
 change is saved at once.
 
-- **Overview** — status, the language, the model, the shortcut; a microphone
+- **Overview**: status, the language, the model, the shortcut; a microphone
   test that transcribes without inserting anything; the last dictation.
-- **Languages & Models** — install, use and delete models per language, with
+- **Languages & Models**: install, use and delete models per language, with
   sizes, the expected time on this computer and the recommendation.
-- **Shortcut & Mode** — record a new shortcut, choose the mode, the hold
+- **Shortcut & Mode**: record a new shortcut, choose the mode, the hold
   time, the silence period and the longest dictation.
-- **Agent mode** — whether opencode was found, turn agent mode on or off, its
+- **Agent mode**: whether opencode was found, turn agent mode on or off, its
   shortcut, the double tap, the confirmation time, the working folder, the
   opencode agent, the terminal, **Start a new conversation** and **Show
   opencode**.
-- **Output** — paste or type, restore the clipboard, capital letter, trailing
+- **Output**: paste or type, restore the clipboard, capital letter, trailing
   space, extra terminal classes, overlay and sounds.
-- **Vocabulary** — words the model should prefer (names, products, jargon).
-- **History** — the last dictations, copy or delete one, clear all.
-- **Advanced** — microphone, threads, priority, keeping the model loaded,
+- **Vocabulary**: words the model should prefer (names, products, jargon).
+- **History**: the last dictations, copy or delete one, clear all.
+- **Advanced**: microphone, threads, priority, keeping the model loaded,
   theme, autostart, and the service.
 
 ### Command line
@@ -308,7 +309,7 @@ sv = ""                  # model id; empty = automatic
 en = ""
 
 [shortcut]
-key = "ctrl+alt+space"   # ctrl, alt, shift, super + a key (space, a–z, 0–9, f1–f24, …)
+key = "ctrl+alt+space"   # ctrl, alt, shift, super + a key (space, a to z, 0 to 9, f1 to f24, ...)
 mode = "hybrid"          # "hybrid", "toggle" or "hold"
 hold_ms = 350            # hybrid: longer than this is push-to-talk
 silence_seconds = 2.0    # stop after this much silence (0 = off)
@@ -334,7 +335,7 @@ microphone = ""          # PipeWire node name; empty = default input
 threads = 0              # 0 = one per physical core (at most 8, one core kept free)
 keep_model_loaded = false
 unload_after_minutes = 10
-nice = 10                # transcription priority (0–19)
+nice = 10                # transcription priority (0 to 19)
 
 [agent]
 enabled = true           # agent mode, when opencode is installed

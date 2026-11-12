@@ -1,6 +1,8 @@
 //! NIRUDICTATE: local speech-to-text dictation for the NIRUX desktop.
 mod agent;
+mod apps;
 mod audio;
+mod command;
 mod config;
 mod daemon;
 mod engine;
@@ -16,6 +18,7 @@ mod models;
 mod omarchy;
 mod overlay;
 mod panel;
+mod runner;
 mod session;
 mod sounds;
 mod text;
@@ -88,6 +91,16 @@ Usage: nirudictate [COMMAND]
   agent show               show the opencode window (scratchpad 9, Super+Alt+9)
   agent send               send the text in the confirmation box now
   agent file FILE.wav      transcribe a WAV and send it like a spoken message
+  command [status]         voice commands: shortcut, language, problems
+  command toggle           listen for a voice command (Super+Alt+Space)
+  command list [--json]    every voice command with Swedish and English phrases
+  command --dry-run TEXT   what TEXT would do, without doing it [--json]
+  command --dry-run --file A.wav [B.wav...]
+                           transcribe like command mode and show what would
+                           run [--language both|dictation|auto|sv|en]
+                           [--no-prompt] [--json]
+  command file FILE.wav    transcribe a WAV and act on it like a spoken command
+  command confirm          run the command that waits for Enter
   doctor                   check the shortcut, audio, models and display
   daemon                   run the background service (normally automatic)
   autostart                start the service if autostart is enabled
@@ -97,7 +110,9 @@ Usage: nirudictate [COMMAND]
 The default shortcut is Ctrl+Alt+Space: tap to start (it stops by itself
 after a pause, or tap again), or hold while speaking and release.
 Shift+Alt+Space works the same way but sends the text to opencode (agent
-mode) after a short confirmation; tap twice quickly for a new conversation.";
+mode) after a short confirmation; tap twice quickly for a new conversation.
+Super+Alt+Space listens for a voice command in Swedish or English: \"öppna
+terminalen\", \"go to workspace 3\", \"lås skärmen\" (see command list).";
 
 fn main() -> ExitCode {
     use_baseline_engine_if_needed();
@@ -133,6 +148,7 @@ fn main() -> ExitCode {
         "transcribe" => transcribe(rest),
         "bench" => bench(rest),
         "agent" => agent_cmd(rest),
+        "command" | "commands" => command_cmd(rest),
         "doctor" => doctor(),
         other => Err(format!("unknown command {other:?}; see nirudictate --help")),
     };
@@ -311,6 +327,323 @@ fn agent_cmd(rest: &[String]) -> Result<(), String> {
         }
     };
     control(request)
+}
+
+fn command_cmd(rest: &[String]) -> Result<(), String> {
+    let json = rest.iter().any(|a| a == "--json");
+    if rest.iter().any(|a| a == "--dry-run" || a == "-n") {
+        return command_dry_run(rest, json);
+    }
+    let sub = rest.first().map(String::as_str).unwrap_or("status");
+    let request = match sub {
+        "status" => {
+            let reply = ipc::send(&Request::Status, Duration::from_secs(3))?;
+            let c = reply
+                .status
+                .and_then(|s| s.command)
+                .ok_or("this service has no voice commands (update NIRUDICTATE)")?;
+            if json {
+                println!("{}", serde_json::to_string(&c).map_err(|e| e.to_string())?);
+                return Ok(());
+            }
+            println!(
+                "shortcut:  {}{}",
+                hotkey::display(&c.shortcut),
+                match &c.problem {
+                    Some(p) => format!(" (off: {p})"),
+                    None if c.shortcut_active => " (active)".into(),
+                    None => " (not active)".into(),
+                }
+            );
+            println!("language:  {}", c.language);
+            return Ok(());
+        }
+        "list" => {
+            command_list(json);
+            return Ok(());
+        }
+        "toggle" => Request::CommandToggle,
+        "confirm" => Request::CommandConfirm,
+        "cancel" => Request::Cancel,
+        "file" => {
+            let path = rest
+                .get(1)
+                .ok_or("usage: nirudictate command file FILE.wav")?;
+            let path = std::fs::canonicalize(path).map_err(|e| format!("{path}: {e}"))?;
+            Request::CommandFile {
+                path: path.display().to_string(),
+            }
+        }
+        other => {
+            return Err(format!(
+                "unknown command action {other:?}; try status, toggle, list, file, confirm or --dry-run"
+            ))
+        }
+    };
+    control(request)
+}
+
+fn command_list(json: bool) {
+    let list = command::phrase_list();
+    if json {
+        let items: Vec<_> = list
+            .iter()
+            .map(|(lang, label, examples)| {
+                serde_json::json!({"language": lang, "command": label, "phrases": examples})
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(items));
+        return;
+    }
+    let mut last = "";
+    for (lang, label, examples) in list {
+        if label != last {
+            println!("{label}");
+            last = label;
+        }
+        println!("  {}: {}", lang.code(), examples.join(" · "));
+    }
+}
+
+/// What a transcript would do, as text or JSON.
+fn describe(heard: &str, prefer: command::Lang, extra: serde_json::Value, json: bool) -> bool {
+    let parsed = command::parse(heard, prefer);
+    if json {
+        let mut v = match &parsed {
+            Some(p) => {
+                let plan = p.intent.plan();
+                serde_json::json!({
+                    "heard": heard, "understood": true, "intent": p.intent.name(),
+                    "language": p.lang, "argv": plan.argv, "stdin": plan.stdin,
+                    "say": if plan.dangerous { p.intent.question(p.lang) } else { p.intent.say(p.lang) },
+                    "dangerous": plan.dangerous,
+                })
+            }
+            None => serde_json::json!({
+                "heard": heard, "understood": false,
+                "say": command::not_understood(command::guess_lang(heard, prefer), heard),
+            }),
+        };
+        if let (Some(obj), Some(more)) = (v.as_object_mut(), extra.as_object()) {
+            for (k, val) in more {
+                obj.insert(k.clone(), val.clone());
+            }
+        }
+        println!("{v}");
+        return parsed.is_some();
+    }
+    println!("heard:     {heard:?}");
+    match &parsed {
+        Some(p) => {
+            let plan = p.intent.plan();
+            println!("intent:    {}", p.intent.name());
+            println!("language:  {}", p.lang.code());
+            println!("runs:      {}", plan.argv.join(" "));
+            if plan.stdin.is_some() {
+                println!("stdin:     the note text");
+            }
+            if plan.dangerous {
+                println!(
+                    "asks:      {} (Enter runs, Esc cancels)",
+                    p.intent.question(p.lang)
+                );
+            } else {
+                println!("says:      {}", p.intent.say(p.lang));
+            }
+        }
+        None => println!(
+            "result:    {} (nothing runs)",
+            command::not_understood(command::guess_lang(heard, prefer), heard)
+        ),
+    }
+    if let Some(obj) = extra.as_object() {
+        if let (Some(a), Some(t)) = (obj.get("audio_seconds"), obj.get("seconds")) {
+            println!(
+                "time:      {:.2} s for {:.1} s of audio (load {:.2} s){}",
+                t.as_f64().unwrap_or(0.0),
+                a.as_f64().unwrap_or(0.0),
+                obj.get("load_seconds")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                obj.get("detected")
+                    .and_then(|v| v.as_str())
+                    .map(|d| format!(", detected {d}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    parsed.is_some()
+}
+
+fn flag_value(rest: &[String], flag: &str) -> Option<String> {
+    rest.iter()
+        .position(|a| a == flag)
+        .and_then(|i| rest.get(i + 1))
+        .cloned()
+}
+
+fn command_dry_run(rest: &[String], json: bool) -> Result<(), String> {
+    let cfg = config::Config::load_or_default();
+    let prefer = command::Lang::from_code(&cfg.general.language);
+    let language = flag_value(rest, "--language");
+    if let Some(l) = &language {
+        if !config::COMMAND_LANGUAGES.contains(&l.as_str()) {
+            return Err(format!(
+                "--language must be one of {}",
+                config::COMMAND_LANGUAGES.join(", ")
+            ));
+        }
+    }
+    let no_prompt = rest.iter().any(|a| a == "--no-prompt");
+    // Files: every argument after --file that is not a flag or a flag value.
+    if let Some(at) = rest.iter().position(|a| a == "--file") {
+        let mut files = Vec::new();
+        let mut skip = false;
+        for a in &rest[at + 1..] {
+            if skip {
+                skip = false;
+                continue;
+            }
+            if a == "--language" || a == "--prompt-style" {
+                skip = true;
+                continue;
+            }
+            if a.starts_with("--") {
+                continue;
+            }
+            files.push(std::fs::canonicalize(a).map_err(|e| format!("{a}: {e}"))?);
+        }
+        if files.is_empty() {
+            return Err("--file needs a WAV file".into());
+        }
+        let mut understood_all = true;
+        let hw = hardware::detect();
+        let mut cfg = cfg.clone();
+        if let Some(l) = &language {
+            cfg.command.language = l.clone();
+        }
+        let passes = daemon::command_models(&cfg, &hw);
+        if passes.is_empty() {
+            return Err("no installed model (nirudictate models install recommended)".into());
+        }
+        let apps = if cfg.command.app_names && !no_prompt {
+            apps::prompt_names(24)
+        } else {
+            Vec::new()
+        };
+        let style = flag_value(rest, "--prompt-style");
+        let prompt_for = |model: &models::Model| -> String {
+            if no_prompt {
+                return String::new();
+            }
+            match style.as_deref() {
+                Some("both") => command::prompt_styled(command::PromptStyle::Both, &apps),
+                _ => command::prompt(command::Lang::from_code(model.language), &apps),
+            }
+        };
+        let loaded = std::sync::Arc::new(std::sync::Mutex::new(engine::Loaded::default()));
+        let e = engine::Engine::spawn(
+            true,
+            Duration::from_secs(600),
+            cfg.advanced.nice,
+            loaded,
+            || {},
+        );
+        for path in files {
+            let started = std::time::Instant::now();
+            let samples = audio::read_wav(&path)?;
+            let samples = audio::trim_silence(&samples)
+                .map(|s| s.to_vec())
+                .unwrap_or(samples);
+            // Like the service: the next language's model only when the
+            // first did not give a command.
+            let mut t = engine::Transcript::default();
+            let mut seconds = 0.0;
+            let mut load = 0.0;
+            for (n, model) in passes.iter().enumerate() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                e.send(engine::Job::Transcribe(engine::Request {
+                    samples: samples.clone(),
+                    model,
+                    // The second model gets no prompt, like the service.
+                    prompt: if n == 0 {
+                        prompt_for(model)
+                    } else {
+                        String::new()
+                    },
+                    threads: cfg.threads(),
+                    full_window: false,
+                    language: daemon::command_language(&cfg),
+                    reply: tx,
+                }));
+                t = rx.recv().map_err(|_| "engine stopped".to_string())??;
+                seconds += t.seconds;
+                load += t.load_seconds;
+                let heard = text::finish(
+                    &t.text,
+                    text::Options {
+                        capitalize: false,
+                        trailing_space: false,
+                    },
+                )
+                .unwrap_or_default();
+                if n + 1 == passes.len() || command::parse(heard.trim(), prefer).is_some() {
+                    break;
+                }
+            }
+            t.seconds = seconds;
+            t.load_seconds = load;
+            let heard = text::finish(
+                &t.text,
+                text::Options {
+                    capitalize: false,
+                    trailing_space: false,
+                },
+            )
+            .unwrap_or_default();
+            let prefer = t
+                .detected
+                .as_deref()
+                .filter(|d| *d == "sv" || *d == "en")
+                .map(command::Lang::from_code)
+                .unwrap_or(prefer);
+            let extra = serde_json::json!({
+                "file": path.display().to_string(),
+                "model": t.model,
+                "audio_seconds": t.audio_seconds,
+                "seconds": t.seconds,
+                "load_seconds": t.load_seconds,
+                "total_seconds": started.elapsed().as_secs_f32(),
+                "detected": t.detected,
+            });
+            if !json {
+                println!("file:      {}", path.display());
+            }
+            understood_all &= describe(heard.trim(), prefer, extra, json);
+            if !json {
+                println!();
+            }
+        }
+        return if understood_all {
+            Ok(())
+        } else {
+            Err("not understood".into())
+        };
+    }
+    let words: Vec<&str> = rest
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        .collect();
+    let text = words.join(" ");
+    if text.trim().is_empty() {
+        return Err("usage: nirudictate command --dry-run \"öppna terminalen\"".into());
+    }
+    if describe(text.trim(), prefer, serde_json::json!({}), json) {
+        Ok(())
+    } else {
+        Err("not understood".into())
+    }
 }
 
 fn language(rest: &[String]) -> Result<(), String> {
@@ -642,6 +975,28 @@ fn doctor() -> Result<(), String> {
                     ),
                 );
             }
+            let clash = agent::conflicting_xkb_options(&options, &cfg.command.key);
+            if !cfg.command.enabled {
+                // Reported with the other command checks below.
+            } else if clash.is_empty() {
+                line(
+                    true,
+                    "command key",
+                    format!(
+                        "{}: no keyboard-layout option uses it",
+                        hotkey::display(&cfg.command.key)
+                    ),
+                );
+            } else {
+                warn(
+                    "command key",
+                    format!(
+                        "{} clashes with the XKB option {} (it also switches the keyboard layout); choose another command shortcut or remove the option",
+                        hotkey::display(&cfg.command.key),
+                        clash.join(", ")
+                    ),
+                );
+            }
             line(
                 xtest,
                 "XTest",
@@ -766,8 +1121,178 @@ fn doctor() -> Result<(), String> {
             }
         }
     }
+    doctor_commands(&cfg, &line, &warn);
     if problems.get() > 0 {
         return Err(format!("{} problem(s) found", problems.get()));
     }
     Ok(())
+}
+
+/// Run a program briefly and return (success, stdout); None when missing.
+fn probe(program: &str, args: &[&str]) -> Option<(bool, String)> {
+    let path = runner::find(program)?;
+    let mut child = std::process::Command::new(path)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some((false, String::new()));
+            }
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Some((out.status.success(), text))
+}
+
+/// A shortcut as a comparable set: sorted modifiers and the key.
+pub fn combo_key(spec: &str) -> Option<(Vec<String>, String)> {
+    let parts: Vec<String> = spec
+        .split('+')
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let (key, mods) = parts.split_last()?;
+    let mut mods: Vec<String> = mods
+        .iter()
+        .map(|m| {
+            match m.as_str() {
+                "control" => "ctrl",
+                "mod1" => "alt",
+                "mod4" | "win" => "super",
+                other => other,
+            }
+            .to_string()
+        })
+        .collect();
+    mods.sort();
+    mods.dedup();
+    Some((mods, key.clone()))
+}
+
+/// NIRUWM bindings (`niructl keys`: `keys<TAB>action`) on the same keys.
+pub fn niruwm_clashes(keys_output: &str, spec: &str) -> Vec<String> {
+    let Some(want) = combo_key(spec) else {
+        return Vec::new();
+    };
+    keys_output
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|(k, _)| combo_key(k).as_ref() == Some(&want))
+        .map(|(k, a)| format!("{k} ({a})"))
+        .collect()
+}
+
+fn doctor_commands(
+    cfg: &config::Config,
+    line: &dyn Fn(bool, &str, String),
+    warn: &dyn Fn(&str, String),
+) {
+    if !cfg.command.enabled {
+        warn(
+            "commands",
+            "voice commands are turned off in the settings".into(),
+        );
+        return;
+    }
+    match probe("niructl", &["keys"]) {
+        Some((true, keys)) => {
+            for (name, spec) in [
+                ("dictation key", &cfg.shortcut.key),
+                ("agent key", &cfg.agent.key),
+                ("command key", &cfg.command.key),
+            ] {
+                let clashes = niruwm_clashes(&keys, spec);
+                if !clashes.is_empty() {
+                    warn(
+                        name,
+                        format!(
+                            "{} is also a NIRUWM key: {}; change one of them",
+                            hotkey::display(spec),
+                            clashes.join(", ")
+                        ),
+                    );
+                }
+            }
+        }
+        Some((false, _)) => warn("NIRUWM keys", "niructl keys failed".into()),
+        None => {}
+    }
+    match probe("niructl", &["do", "--list"]) {
+        None => warn(
+            "commands",
+            "niructl not found: window, workspace and lock commands need NIRUWM".into(),
+        ),
+        Some((true, _)) => line(true, "commands", "niructl do (NIRUWM actions)".into()),
+        Some((false, _)) => warn(
+            "commands",
+            "this NIRUWM has no `niructl do`: window, workspace, terminal and browser commands need a newer NIRUWM (lock and layouts still work)".into(),
+        ),
+    }
+    match probe("nirulauncher", &["--help"]) {
+        None => warn(
+            "commands",
+            "nirulauncher not found: \"open APP\", notes and search need NIRULAUNCHER".into(),
+        ),
+        Some((_, help)) if !help.contains("--launch-best") => warn(
+            "commands",
+            "this NIRULAUNCHER cannot open an app by name or save a note by voice yet (needs --launch-best and --note --stdin)".into(),
+        ),
+        Some(_) => line(true, "commands", "nirulauncher (apps, notes, search)".into()),
+    }
+    for (program, what) in [
+        ("playerctl", "play/pause/next track"),
+        ("wpctl", "volume N % and mute"),
+        ("nirushot", "screenshots"),
+    ] {
+        if runner::find(program).is_none() {
+            warn(
+                "commands",
+                format!("{program} not found: \"{what}\" commands will fail"),
+            );
+        }
+    }
+    if let Ok(r) = ipc::send(&Request::Status, Duration::from_secs(2)) {
+        if let Some(c) = r.status.and_then(|s| s.command) {
+            line(
+                c.shortcut_active,
+                "command shortcut",
+                if c.shortcut_active {
+                    format!("{} grabbed", hotkey::display(&c.shortcut))
+                } else {
+                    c.problem.unwrap_or_else(|| "not active".into())
+                },
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_niruwm_bindings_on_the_same_keys() {
+        let keys =
+            "super+Return\tterminal\nalt+super+space\tshell foo\nsuper+alt+period\tfocusmon 1\n";
+        assert_eq!(
+            niruwm_clashes(keys, "super+alt+space"),
+            ["alt+super+space (shell foo)"]
+        );
+        assert!(niruwm_clashes(keys, "ctrl+alt+space").is_empty());
+        assert_eq!(combo_key("Mod4+Mod1+Space"), combo_key("alt+super+space"));
+    }
 }

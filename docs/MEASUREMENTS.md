@@ -116,3 +116,58 @@ The released binaries on othala (KB-Whisper Small, the 8.3 s sentence):
 
 The baseline engine is about 4.2× slower; the recommendation uses that factor
 on CPUs without AVX2, which therefore get Tiny or Base.
+
+## Voice commands
+
+NIRUDICTATE 0.3.0 on othala, KB-Whisper Small (q8_0) for Swedish and Whisper
+Small (English, q8_0) installed, 5 threads, full 30 s window. Test clips:
+50 Swedish commands spoken by two Piper voices (`sv_SE-nst-medium`,
+`sv_SE-lisa-medium`, 100 clips) and the same 50 commands in English by four
+(`en_US-lessac`, `en_US-amy`, `en_GB-alan`, `en_US-ryan`, 200 clips); 48 are
+commands, 2 per language are questions that must not run anything. Each
+clip went through `nirudictate command --dry-run --file` and counts as
+right when it gives the same intent as the written phrase. "Wrong" means a
+different command; "not understood" means nothing would run. Time is the
+transcription after the model is loaded (the service loads it while you
+speak), both passes together when the second model was needed.
+
+The Piper Swedish voices are hard: KB-Whisper writes "Lås armen" for "Lås
+skärmen" and "Hellerm" for "Helskärm". Real voices in a quiet room do
+better; the numbers compare settings, they do not promise accuracy.
+
+| Setting | Swedish clips | English clips | Time (median) |
+|---|---|---|---|
+| Swedish model only, command prompt (first matcher) | 61 right, 1 wrong | 77 right, 7 wrong | 3.2 s |
+| Swedish model only, no prompt (first matcher) | 58 right, 0 wrong | 101 right, 4 wrong | 2.8 s |
+| Swedish model, language detection (`auto`, first matcher) | 61 right, 1 wrong | 77 right, 7 wrong | 5.9 s |
+| English model, English prompt (first matcher) | | 183 right, 1 wrong | 3.0 s |
+| Swedish model only, command prompt (final matcher) | 78 right, 1 wrong | 118 right, 4 wrong | 3.2 s |
+| **`both` (default): Swedish model, then English without a prompt** | **78 / 100 right, 1 wrong** | **186 / 200 right, 4 wrong** | **3.3 s** (max 7.4 s and 8.1 s) |
+| `both`, shortened window (`NIRUDICTATE_AUDIO_CTX=768`) | 73 right, 1 wrong | 92 / 100 right, 3 wrong (two voices) | 1.5 s |
+
+What this decided:
+
+- **Force the language, do not detect it.** KB-Whisper's language detection
+  said Swedish for every English clip, so `auto` gave exactly the same text
+  and took almost twice as long. `auto` stays as a setting but is not the
+  default.
+- **Two models beat one.** With the Swedish model alone 59 % of the English
+  clips were understood (KB-Whisper often writes them in Swedish, which the
+  matcher handles, but not always well); trying the English model when the
+  Swedish text matched nothing gives 93 % at the cost of a second pass for
+  those clips only. Swedish clips are unaffected (the English model gets no
+  prompt; with the command prompt it once wrote "Open terminal" for
+  unclear Swedish speech, a wrong command, so the prompt was dropped for the
+  second pass).
+- **The command prompt helps Swedish (78 vs 70 with the final matcher) and
+  the program names in it do no harm**, but on English speech it pushes
+  KB-Whisper to translate; the second pass covers that.
+- **Near misses and the KB translations** in the matcher raised the Swedish
+  model's results from 61 to 78 (Swedish) and from 77 to 118 (English)
+  without new wrong commands.
+- Every "wrong" result in the final setting is "open X" with a misheard
+  name (`Öppna nästa menyn`, `Öppna lauren`): the launcher then shows its
+  list with that text unless a program matches it clearly. No wrong
+  workspace, window or power command was produced in 300 clips.
+- **The full window stays.** The shortened encoder window halves the time
+  but loses 5 Swedish commands in 100.

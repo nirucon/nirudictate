@@ -1,6 +1,6 @@
 # NIRUDICTATE
 
-Local speech-to-text dictation: press Ctrl+Alt+Space, speak, and the text appears where you type. Press Shift+Alt+Space instead to talk to the opencode agent.
+Local speech-to-text dictation: press Ctrl+Alt+Space, speak, and the text appears where you type. Press Super+Alt+Space to control the desktop by voice, in Swedish or English, or Shift+Alt+Space to talk to the opencode agent.
 
 **Status: alpha** · Part of the [NIRUX](https://github.com/nirucon/nirux) suite · [MIT License](LICENSE)
 
@@ -19,6 +19,10 @@ other X11 desktops.
 - **Swedish first.** Swedish uses [KB-Whisper](https://huggingface.co/KBLab)
   from KBLab, the National Library of Sweden's data lab, trained on 50 000 hours
   of Swedish. English uses OpenAI's Whisper.
+- **Voice commands.** Super+Alt+Space and "öppna terminalen", "go to
+  workspace 3", "lås skärmen", "höj volymen" or "take a screenshot". Swedish
+  and English, matched by fixed rules on this computer; only a fixed list of
+  desktop actions can run, and closing or powering off asks first.
 - **Talk to an agent.** Shift+Alt+Space sends what you say to
   [opencode](https://opencode.ai) instead of typing it. The opencode window
   lives in NIRUWM scratchpad 9 and comes to the front with each message.
@@ -55,6 +59,12 @@ take the paste, the text is typed instead. See
 - NIRUX integration: NIRUBAR `dictation` module, `dictation` sound category,
   started by the NIRUX session.
 - Checksum-verified, resumable model downloads.
+- Voice commands (`Super+Alt+Space`): terminal, browser, workspaces, moving
+  windows, layouts, fullscreen, lock screen, launcher, overview, night light,
+  do not disturb, volume, brightness, media keys, screenshots, quick notes,
+  web search, opening any installed program, and (after a confirmation)
+  close window, suspend, restart, shut down and log out. See
+  [Voice commands](#voice-commands).
 - Agent mode (`Shift+Alt+Space`): local transcription, a short confirmation,
   then the text goes to opencode through its own server API, in one ongoing
   conversation (a double tap starts a new one). See
@@ -73,6 +83,11 @@ take the paste, the text is typed instead. See
 - The microphone is opened only while you dictate: the recorder process
   exists only then, so PipeWire shows NIRUDICTATE as a recording client only
   while the red dot is on.
+- Voice commands are transcribed and matched on this computer, without a
+  language model. They can only start the fixed actions listed under
+  [Voice commands](#voice-commands), each as one program with fixed arguments
+  (never a shell). What you said is not logged; the log names only the
+  action ("voice command: workspace 3").
 - Agent mode is the one exception to "nothing leaves this computer": the
   speech is still transcribed locally, but the *text* you confirm is handed to
   opencode, which sends it to the AI provider that opencode is set up to use.
@@ -84,6 +99,14 @@ take the paste, the text is typed instead. See
 - X11 (NIRUWM or any other X11 desktop) with XTest.
 - OpenGL and `libxkbcommon-x11` for the panel (every NIRUX install has them).
 - A recorder: `pw-record` (PipeWire), or `parec`/`arecord` without PipeWire.
+- Voice commands: NIRUWM with `niructl do` for the window, workspace,
+  terminal and browser commands, and NIRULAUNCHER with `--launch-best` and
+  `--note --stdin` for opening programs and saving notes (both from the
+  NIRUX release that ships NIRUDICTATE 0.3). With older versions those
+  commands say "Update NIRUWM" or "Update NIRULAUNCHER" in the overlay;
+  lock screen and layouts fall back to older `niructl` commands. `playerctl`
+  for media keys, `wpctl` (WirePlumber) for volume, `nirushot` for
+  screenshots.
 - Agent mode only: [opencode](https://opencode.ai) 1.x or 2.x with a provider
   set up, and a terminal (kitty, alacritty or xterm). NIRUWM 0.17.9 or newer
   keeps the opencode window in scratchpad 9; with an older window manager it
@@ -180,6 +203,91 @@ stops after a pause, or hold while you speak), but the text goes to
   (Alt+Shift changes the layout); choose another agent shortcut in the panel
   or drop the option.
 
+### Voice commands
+
+**Super+Alt+Space** works like the dictation shortcut (tap and speak, it stops
+after a short pause; or hold while you speak), but what you say is matched
+against a list of desktop commands instead of being typed:
+
+1. The overlay shows **CMD** next to the language while it listens.
+2. The speech is transcribed on this computer with the dictation model.
+   Whisper gets a short hint with the command words and the programs you
+   start most from the launcher.
+3. Fixed rules match it, in Swedish and English. Politeness and fillers are
+   fine ("kan du", "snälla", "please", "eh"), numbers work as words, digits
+   and ordinals ("tre", "trean", "tredje", "3", "three", "third"), and the
+   common mishearings ("to" for two, "for" for four) are handled. The
+   Swedish model often writes English speech in Swedish ("open terminal"
+   becomes "Öppna terminalen"), which matches too.
+4. A safe command runs at once and the overlay says what it does, in the
+   language you spoke ("Öppnar terminal", "Opening terminal"). **Closing a
+   window, suspend, restart, shut down and log out ask first**: a box shows
+   the question, **Enter** runs it, **Esc** cancels, and after 15 seconds it
+   is dropped; it never runs by itself.
+5. When nothing matches, **nothing runs**: the overlay says "Förstod inte:
+   …" or "Not understood: …" with what it heard, and the error sound plays.
+
+| Command | Swedish, for example | English, for example |
+|---|---|---|
+| Terminal | öppna terminalen, ny terminal | open terminal, new terminal |
+| Browser (NIRUWM's browser setting) | öppna webbläsaren | open the browser |
+| Workspace N (1 to 10) | gå till arbetsyta tre, byt till skrivbord 2 | go to workspace three, switch to desktop 2 |
+| Move the window to workspace N | flytta fönstret till arbetsyta fyra | move the window to workspace four |
+| Next / previous workspace | nästa arbetsyta, föregående arbetsyta | next workspace, previous workspace |
+| Close the window (asks first) | stäng fönstret | close the window |
+| Fullscreen, floating | helskärm, gör fönstret flytande | fullscreen, make the window floating |
+| Layout | byt till monokel, kakel, flytande layout, nästa layout | switch to monocle, tiling layout, next layout |
+| Lock the screen | lås skärmen | lock the screen |
+| Launcher, web search, window jump | öppna startmenyn, sök, fönsterhopp | open the launcher, search, window jump |
+| Quick note window | ny anteckning | new note |
+| Overview of the workspaces | visa översikten | show the overview |
+| Night light | slå på nattljuset, nattljus av | turn on the night light, night light off |
+| Do not disturb | slå på stör ej, stäng av stör ej | turn on do not disturb, do not disturb off |
+| Next / previous screen | nästa skärm, föregående skärm | next monitor, previous monitor |
+| Volume | höj volymen, sänk volymen, volym 50 procent | volume up, quieter, set the volume to 50 percent |
+| Sound and microphone | stäng av ljudet, slå på ljudet, stäng av mikrofonen | mute, unmute, mute the microphone |
+| Brightness | ljusare, mörkare, ljusstyrka 70 procent | brighter, dimmer, brightness 70 percent |
+| Media | spela, pausa, nästa låt, föregående låt, stoppa musiken | play, pause, next song, previous song, stop the music |
+| Screenshot | ta en skärmbild, skärmbild av ett område, skärmbild av fönstret | take a screenshot, screenshot of a region, screenshot of the window |
+| Note with text (to the inbox) | anteckning köp mjölk, kom ihåg att ringa Åsa | note buy milk, remember to call Anna |
+| Web search | sök efter väder i Stockholm, googla pannkakor | search for the weather in London |
+| Open any installed program | öppna Spotify, starta Thunderbird | open Spotify, launch Thunderbird |
+| Suspend (asks first) | viloläge, sätt datorn i viloläge | suspend, put the computer to sleep |
+| Restart (asks first) | starta om datorn | restart the computer |
+| Shut down (asks first) | stäng av datorn | shut down the computer |
+| Log out (asks first) | logga ut | log out |
+
+`nirudictate command list` prints every command with more phrases, and the
+panel's **Voice commands** tab shows the same list. Try a phrase without
+running anything with `nirudictate command --dry-run "gå till arbetsyta tre"`.
+
+- **How it runs.** Window manager actions go through `niructl do` (the same
+  actions as NIRUWM's key bindings; it refuses `shell`, `start` and `quit`),
+  night light and do not disturb through `niructl nightlight` and
+  `niructl dnd`, volume through `niructl audio` and `wpctl`, brightness
+  through `niructl brightness`, media through `playerctl`, screenshots
+  through `nirushot`, notes through `nirulauncher --note --stdin` and search
+  through `nirulauncher --search`. "Open X" asks the launcher to rank the
+  apps like its own list: a clear match starts at once, otherwise the
+  launcher opens with X typed so you can pick. "Terminal" and "browser"
+  always mean NIRUWM's terminal and browser settings.
+- **Language.** The dictation language's model listens first. When its
+  text matches no command and the other language's model is installed
+  (Languages & Models), the same audio is tried once more with that model,
+  so English commands work for a Swedish user with both models installed
+  (`[command] language = "both"`, the default). With the Swedish model
+  alone many English commands still work, as above. `dictation` uses only
+  the dictation model, `sv`/`en` only that language's model, and `auto`
+  lets whisper detect the language (measured slower and no better; see
+  [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)).
+- **Near misses.** When nothing matches word for word, one misheard word
+  may still match ("stada webbläsaren", "lås stärmen", "arbets-yta"), if the
+  words around it match exactly. A single word is never guessed.
+- `nirudictate doctor` checks the command shortcut against XKB layout
+  switches (`grp:win_space_toggle`, `grp:alt_space_toggle`) and NIRUWM's own
+  key bindings, and whether `niructl do`, NIRULAUNCHER, `playerctl`, `wpctl`
+  and `nirushot` are there.
+
 ### Shortcut and modes
 
 | Mode | How it works |
@@ -237,7 +345,8 @@ code; a file that does not match is deleted.
 ### The control panel
 
 `nirudictate settings [TAB]` opens the panel (tabs: `overview`, `models`,
-`shortcut`, `agent`, `output`, `vocabulary`, `history`, `advanced`). Every
+`shortcut`, `agent`, `commands`, `output`, `vocabulary`, `history`,
+`advanced`). Every
 change is saved at once.
 
 - **Overview**: status, the language, the model, the shortcut; a microphone
@@ -250,6 +359,9 @@ change is saved at once.
   shortcut, the double tap, the confirmation time, the working folder, the
   opencode agent, the terminal, **Start a new conversation** and **Show
   opencode**.
+- **Voice commands**: turn them on or off, the shortcut, the language, the
+  program-name hint, asking before dangerous commands, and every phrase it
+  understands.
 - **Output**: paste or type, restore the clipboard, capital letter, trailing
   space, extra terminal classes, overlay and sounds.
 - **Vocabulary**: words the model should prefer (names, products, jargon).
@@ -280,6 +392,14 @@ nirudictate agent new           the next message starts a new conversation
 nirudictate agent show          show the opencode window (scratchpad 9)
 nirudictate agent send          send the text in the confirmation box now
 nirudictate agent file FILE.wav transcribe a WAV and send it like speech
+nirudictate command [status]    voice commands: shortcut and language [--json]
+nirudictate command toggle      listen for a voice command (Super+Alt+Space)
+nirudictate command list [--json]  every command with Swedish and English phrases
+nirudictate command --dry-run "TEXT" [--json]   what TEXT would do, without doing it
+nirudictate command --dry-run --file A.wav [B.wav…] [--language both|dictation|sv|en|auto] [--no-prompt] [--json]
+                                transcribe like command mode and show what would run
+nirudictate command file FILE.wav   transcribe a WAV and act on it like speech
+nirudictate command confirm     run the command that waits for Enter
 nirudictate doctor              check display, XTest, audio, models, shortcuts, opencode
 nirudictate reload              re-read config.toml
 nirudictate unload              free the loaded model now
@@ -289,7 +409,7 @@ nirudictate quit                stop the service
 ```
 
 `status --json` is a stable machine-readable form (`state`, `language`,
-`model`, `loaded`, `shortcut_active`, `last`, `error`, `agent`, …).
+`model`, `loaded`, `shortcut_active`, `last`, `error`, `agent`, `command`, …).
 
 ## Configuration
 
@@ -346,6 +466,13 @@ confirm_seconds = 2.0    # the box sends by itself after this (0 = no box)
 double_tap_new = true    # a quick double tap starts a new conversation
 terminal = "auto"        # "auto" (kitty, alacritty, xterm) or one of them
 opencode = ""            # path to opencode; empty = PATH, ~/.opencode/bin, ~/.local/bin
+
+[command]
+enabled = true           # voice commands
+key = "super+alt+space"  # same modes as [shortcut]; must differ from the other two keys
+confirm_dangerous = true # close window, suspend, restart, shut down and log out wait for Enter
+language = "both"        # "both" (dictation language, then the other model), "dictation", "sv", "en" or "auto"
+app_names = true         # name the programs you start most in whisper's hint
 ```
 
 ### Sounds
@@ -362,7 +489,7 @@ NIRUBAR's `dictation` module shows a red dot while recording and a different
 mark while transcribing, followed by `AI` in agent mode (NIRUBAR 0.18.90).
 Other bars can read `$XDG_RUNTIME_DIR/nirudictate/state.json`
 (`{"version":1,"state":"recording","pid":…,"pid_start":…,"since":…,"language":"sv"}`,
-plus `"target":"agent"` in agent mode; replaced atomically on every change) or watch the root window property
+plus `"target":"agent"` in agent mode and `"target":"command"` while it listens for a voice command; replaced atomically on every change) or watch the root window property
 `_NIRUDICTATE_STATE`; `nirudictate state` prints the word.
 
 ## Files and paths
@@ -404,13 +531,23 @@ Start with `nirudictate doctor`.
   opencode was found and the shortcut is active. Without opencode agent mode
   is off. If the keyboard layout changes when you press it, the XKB option
   `grp:alt_shift_toggle` (or a similar one) uses Alt+Shift; `doctor` names it.
+- **Super+Alt+Space does nothing.** `nirudictate command status` says
+  whether the shortcut is active; `doctor` names a NIRUWM binding or XKB
+  option on the same keys.
+- **"Update NIRUWM" or "Update NIRULAUNCHER" after a command.** The window
+  manager or launcher is older than voice commands; `nirux update`, then log
+  out and in.
+- **A command is not understood.** `nirudictate command --dry-run "what you
+  said"` shows whether the words match; the overlay shows what was heard.
+  Speak the command alone, without other words around it.
 - **The opencode window is a normal window, not scratchpad 9.** The window
   manager is older than NIRUWM 0.17.9; log out and in after `nirux update`.
 - **opencode answers "not authenticated" or picks the wrong model.** Set
   opencode up once in a terminal (`opencode auth login`, `opencode models`);
   agent mode uses opencode's own configuration.
 - **Logs.** The service logs each dictation (model, time, how the text was
-  inserted; never the text) to `~/.local/state/niruwm/nirudictate.log` when
+  inserted; never the text) and each voice command (the action's name, never
+  what was said) to `~/.local/state/niruwm/nirudictate.log` when
   the NIRUX session started it, and to `~/.local/state/nirudictate/daemon.log`
   when the panel or the installer did.
 

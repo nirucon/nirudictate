@@ -22,6 +22,9 @@ pub struct Transcript {
     pub load_seconds: f32,
     /// Seconds spent transcribing.
     pub seconds: f32,
+    /// The language whisper detected, when it was asked to (command mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected: Option<String>,
 }
 
 pub struct Request {
@@ -31,6 +34,9 @@ pub struct Request {
     pub threads: u32,
     /// Encode the whole 30 s window (slower, the reference behaviour).
     pub full_window: bool,
+    /// Another language than the model's: `auto` detects it (multilingual
+    /// models only; command mode).
+    pub language: Option<String>,
     pub reply: Sender<Result<Transcript, String>>,
 }
 
@@ -205,8 +211,9 @@ fn worker(
                 }
                 let ctx = &current.as_ref().expect("model loaded").ctx;
                 let t = Instant::now();
-                let result = run(ctx, &req).map(|text| Transcript {
+                let result = run(ctx, &req).map(|(text, detected)| Transcript {
                     text,
+                    detected,
                     model: req.model.id.to_string(),
                     language: req.model.language.to_string(),
                     audio_seconds: req.samples.len() as f32 / crate::audio::RATE as f32,
@@ -219,11 +226,17 @@ fn worker(
     }
 }
 
-fn run(ctx: &WhisperContext, req: &Request) -> Result<String, String> {
+fn run(ctx: &WhisperContext, req: &Request) -> Result<(String, Option<String>), String> {
     let mut state = ctx.create_state().map_err(|e| e.to_string())?;
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_n_threads(req.threads.max(1) as i32);
-    params.set_language(Some(req.model.whisper_language()));
+    // KB-Whisper keeps the multilingual vocabulary; the `.en` models do not.
+    let language = match req.language.as_deref() {
+        Some("auto") if req.model.multilingual() => "auto",
+        Some(code) if req.model.multilingual() && code != "auto" => code,
+        _ => req.model.whisper_language(),
+    };
+    params.set_language(Some(language));
     params.set_translate(false);
     params.set_no_context(true);
     params.set_no_timestamps(true);
@@ -258,7 +271,11 @@ fn run(ctx: &WhisperContext, req: &Request) -> Result<String, String> {
             out.push_str(&text);
         }
     }
-    Ok(out)
+    let detected = (language == "auto")
+        .then(|| whisper_rs::get_lang_str(state.full_lang_id_from_state()))
+        .flatten()
+        .map(str::to_string);
+    Ok((out, detected))
 }
 
 /// Encoder frames (50 per second) for a shortened window, or None for the
@@ -297,6 +314,7 @@ pub fn transcribe_now(
         prompt,
         threads,
         full_window: false,
+        language: None,
         reply: tx,
     }));
     rx.recv().map_err(|_| "engine stopped".to_string())?

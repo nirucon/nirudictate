@@ -102,6 +102,13 @@ pub fn render(cfg: &Config, agent: bool) -> String {
             &["nirudictate", "agent", "toggle"],
         );
     }
+    if cfg.command.enabled {
+        add(
+            &cfg.command.key,
+            "Voice command: say what to do (open terminal, workspace 3, lock screen)",
+            &["nirudictate", "command", "toggle"],
+        );
+    }
     out
 }
 
@@ -152,9 +159,10 @@ mod tests {
         assert_eq!(v["app"].as_str(), Some("NIRUDICTATE"));
         assert_eq!(v["group"].as_str(), Some("Dictation"));
         let keys = v["keys"].as_array().unwrap();
-        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.len(), 3);
         assert_eq!(keys[0]["keys"].as_str(), Some("ctrl+alt+space"));
         assert_eq!(keys[1]["keys"].as_str(), Some("shift+alt+space"));
+        assert_eq!(keys[2]["keys"].as_str(), Some("super+alt+space"));
         assert_eq!(
             keys[1]["run"].as_array().unwrap().len(),
             3,
@@ -172,9 +180,10 @@ mod tests {
         }
 
         cfg.shortcut.key = "super+f9".into();
+        cfg.command.enabled = false;
         let v: toml::Value = toml::from_str(&render(&cfg, false)).unwrap();
         let keys = v["keys"].as_array().unwrap();
-        assert_eq!(keys.len(), 1, "no agent key when agent mode is off");
+        assert_eq!(keys.len(), 1, "no agent or command key when they are off");
         assert_eq!(keys[0]["keys"].as_str(), Some("super+F9"));
 
         cfg.shortcut.key = "ctrl+insert".into();

@@ -7,14 +7,16 @@
 //! model, no animation, no timers.
 use crate::agent::{self, Outcome};
 use crate::audio::{self, Capture};
+use crate::command::{self, Intent, Lang};
 use crate::config::{self, Config};
 use crate::engine::{self, Engine, Job, Loaded, Transcript};
 use crate::hardware::{self, Hardware};
 use crate::hotkey::{self, Action, Controller};
 use crate::insert::{Insert, Inserter};
-use crate::ipc::{AgentStatus, LastResult, Reply, Request, Status};
+use crate::ipc::{AgentStatus, CommandStatus, LastResult, Reply, Request, Status};
 use crate::models::{self, Model};
 use crate::overlay::{self, Overlay, View};
+use crate::runner::{self, Done, Fail};
 use crate::sounds::{self, Cue};
 use crate::{history, live, text, theme};
 use std::io::{BufRead, BufReader, Write};
@@ -127,6 +129,23 @@ enum Phase {
         text: String,
         started: Instant,
     },
+    /// Command mode: a dangerous command waits for Enter (Esc cancels; it
+    /// cancels by itself after a while, it never runs by itself).
+    CommandConfirm {
+        intent: Intent,
+        lang: Lang,
+        until: Instant,
+    },
+}
+
+/// How long a dangerous command waits for Enter before it is dropped.
+const COMMAND_CONFIRM: Duration = Duration::from_secs(15);
+
+/// A finished voice command, from its worker thread.
+struct CommandOutcome {
+    intent: Intent,
+    lang: Lang,
+    result: Result<Done, Fail>,
 }
 
 impl Phase {
@@ -138,7 +157,8 @@ impl Phase {
             Phase::Transcribing { .. }
             | Phase::Inserting { .. }
             | Phase::Confirming { .. }
-            | Phase::Sending { .. } => "transcribing",
+            | Phase::Sending { .. }
+            | Phase::CommandConfirm { .. } => "transcribing",
         }
     }
 }
@@ -150,6 +170,18 @@ enum Target {
     Text,
     /// Sent to opencode (Shift+Alt+Space).
     Agent,
+    /// Matched against the voice commands (Super+Alt+Space).
+    Command,
+}
+
+impl Target {
+    fn word(self) -> Option<&'static str> {
+        match self {
+            Target::Text => None,
+            Target::Agent => Some("agent"),
+            Target::Command => Some("command"),
+        }
+    }
 }
 
 /// Escape, Return and KP_Enter answer the confirmation box.
@@ -180,6 +212,17 @@ struct Daemon {
     agent_done: Receiver<Outcome>,
     agent_grabbed: Vec<(u8, u16)>,
     agent_error: Option<String>,
+    command_grabbed: Vec<(u8, u16)>,
+    command_error: Option<String>,
+    command_tx: Sender<CommandOutcome>,
+    command_done: Receiver<CommandOutcome>,
+    /// The command's audio and the next model to try when the first one's
+    /// transcript matched nothing (`[command] language = "both"`).
+    command_retry: Option<(Vec<f32>, Vec<&'static Model>)>,
+    /// What the first model heard, shown when no model found a command.
+    command_first_heard: Option<String>,
+    /// Program names for whisper's prompt, refreshed once a minute at most.
+    app_names: Option<(Instant, Vec<String>)>,
     /// Keycodes grabbed while the confirmation box is up, with their keysym.
     confirm_grabbed: Vec<(u8, u32)>,
     target: Target,
@@ -295,6 +338,7 @@ pub fn run(foreground_message: bool) -> Result<(), String> {
     };
     let clients = listen(waker.clone())?;
     let (agent_tx, agent_done) = mpsc::channel();
+    let (command_tx, command_done) = mpsc::channel();
     let w = waker.clone();
     let agent = agent::Agent::spawn(cfg.agent.clone(), agent_tx, move || w.wake());
     let state_atom = intern(&conn, "_NIRUDICTATE_STATE");
@@ -326,6 +370,13 @@ pub fn run(foreground_message: bool) -> Result<(), String> {
         agent_done,
         agent_grabbed: Vec::new(),
         agent_error: None,
+        command_grabbed: Vec::new(),
+        command_error: None,
+        command_tx,
+        command_done,
+        app_names: None,
+        command_retry: None,
+        command_first_heard: None,
         confirm_grabbed: Vec::new(),
         target: Target::Text,
         fresh: false,
@@ -342,13 +393,17 @@ pub fn run(foreground_message: bool) -> Result<(), String> {
     d.grab();
     d.publish();
     eprintln!(
-        "nirudictate {}: ready ({}, {}, engine {}; agent {})",
+        "nirudictate {}: ready ({}, {}, engine {}; agent {}; commands {})",
         env!("CARGO_PKG_VERSION"),
         hotkey::display(&d.cfg.shortcut.key),
         d.cfg.general.language,
         crate::engine_variant(),
         match &d.agent_error {
             None => hotkey::display(&d.cfg.agent.key),
+            Some(e) => e.clone(),
+        },
+        match &d.command_error {
+            None => hotkey::display(&d.cfg.command.key),
             Some(e) => e.clone(),
         }
     );
@@ -465,6 +520,13 @@ impl Daemon {
             // Only the "Sending…" animation; the agent thread wakes us.
             return 50;
         }
+        if let Phase::CommandConfirm { until, .. } = &self.phase {
+            // Nothing moves in the box; wake only to drop it.
+            return until
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .clamp(1, 60_000) as i32;
+        }
         if !matches!(self.phase, Phase::Idle) || !self.pending_files.is_empty() {
             return 33;
         }
@@ -514,6 +576,7 @@ impl Daemon {
         let lists = [
             std::mem::take(&mut self.grabbed),
             std::mem::take(&mut self.agent_grabbed),
+            std::mem::take(&mut self.command_grabbed),
         ];
         for (code, mods) in lists.into_iter().flatten() {
             for extra in [0u16, 2, 16, 18] {
@@ -596,6 +659,13 @@ impl Daemon {
             self.agent_grabbed = grabbed;
             problem
         };
+        self.command_error = if !self.cfg.command.enabled {
+            Some("command mode is turned off in the settings".into())
+        } else {
+            let (grabbed, problem) = self.grab_combo(&self.cfg.command.key.clone());
+            self.command_grabbed = grabbed;
+            problem
+        };
         let _ = self.conn.flush();
         // The cheat sheet (Super+/) lists the keys this service really uses.
         let agent_in_use =
@@ -652,6 +722,8 @@ impl Daemon {
             Some(Target::Text)
         } else if hit(&self.agent_grabbed) {
             Some(Target::Agent)
+        } else if hit(&self.command_grabbed) {
+            Some(Target::Command)
         } else {
             None
         }
@@ -676,6 +748,12 @@ impl Daemon {
                         } else {
                             self.send_to_agent();
                         }
+                    } else if matches!(self.phase, Phase::CommandConfirm { .. }) {
+                        if keysym == 0xff1b {
+                            self.cancel();
+                        } else {
+                            self.confirm_command();
+                        }
                     }
                     return;
                 }
@@ -692,6 +770,7 @@ impl Daemon {
                             | Phase::Inserting { .. }
                             | Phase::Confirming { .. }
                             | Phase::Sending { .. }
+                            | Phase::CommandConfirm { .. }
                     );
                     if matches!(self.phase, Phase::Idle) {
                         self.target = target;
@@ -710,6 +789,7 @@ impl Daemon {
                     .grabbed
                     .iter()
                     .chain(self.agent_grabbed.iter())
+                    .chain(self.command_grabbed.iter())
                     .any(|(c, _)| *c == e.detail)
                 {
                     self.key_down = false;
@@ -748,6 +828,105 @@ impl Daemon {
         models::active(&lang, self.cfg.model_for(&lang), &self.hw)
     }
 
+    /// The model for this dictation's target.
+    fn model_for_target(&self) -> Option<&'static Model> {
+        if self.target == Target::Command {
+            command_model(&self.cfg, &self.hw)
+        } else {
+            self.current_model()
+        }
+    }
+
+    /// Keep a command's audio for the other language's model.
+    fn prepare_retry(&mut self, samples: &[f32], first: &'static Model) {
+        self.command_retry = None;
+        self.command_first_heard = None;
+        if self.target != Target::Command {
+            return;
+        }
+        let rest: Vec<&'static Model> = command_models(&self.cfg, &self.hw)
+            .into_iter()
+            .filter(|m| m.id != first.id)
+            .collect();
+        if !rest.is_empty() {
+            self.command_retry = Some((samples.to_vec(), rest));
+        }
+    }
+
+    /// Transcribe the command again with the next model. False when there
+    /// is none left.
+    fn retry_command(&mut self) -> bool {
+        let Some((samples, mut rest)) = self.command_retry.take() else {
+            return false;
+        };
+        if rest.is_empty() {
+            return false;
+        }
+        let model = rest.remove(0);
+        if !rest.is_empty() {
+            self.command_retry = Some((samples.clone(), rest));
+        }
+        log(format!("voice command not matched; trying {}", model.id));
+        let (tx, rx) = mpsc::channel();
+        let mut request = self.transcribe_request(samples, model, tx);
+        // No command words in the second model's prompt: on speech in the
+        // other language whisper would write the prompt's commands back.
+        request.prompt.clear();
+        self.engine.send(Job::Transcribe(request));
+        self.phase = Phase::Transcribing {
+            rx,
+            started: Instant::now(),
+        };
+        self.publish();
+        self.draw();
+        true
+    }
+
+    /// Program names for the command prompt (cached for a minute).
+    fn prompt_apps(&mut self) -> Vec<String> {
+        if !self.cfg.command.app_names {
+            return Vec::new();
+        }
+        if let Some((at, names)) = &self.app_names {
+            if at.elapsed() < Duration::from_secs(60) {
+                return names.clone();
+            }
+        }
+        let names = crate::apps::prompt_names(24);
+        self.app_names = Some((Instant::now(), names.clone()));
+        names
+    }
+
+    /// The engine request for a recording, by target.
+    fn transcribe_request(
+        &mut self,
+        samples: Vec<f32>,
+        model: &'static Model,
+        reply: Sender<Result<Transcript, String>>,
+    ) -> engine::Request {
+        let (prompt, language) = if self.target == Target::Command {
+            let apps = self.prompt_apps();
+            (
+                command::prompt(Lang::from_code(model.language), &apps),
+                command_language(&self.cfg),
+            )
+        } else {
+            (
+                text::prompt(&self.cfg.vocabulary.words, model.language),
+                None,
+            )
+        };
+        engine::Request {
+            samples,
+            model,
+            prompt,
+            threads: self.cfg.threads(),
+            full_window: false,
+            language,
+            reply,
+        }
+    }
+
     fn start(&mut self) {
         if !matches!(self.phase, Phase::Idle) {
             return;
@@ -759,7 +938,7 @@ impl Daemon {
             self.cue(Cue::Error);
             return;
         }
-        let Some(model) = self.current_model() else {
+        let Some(model) = self.model_for_target() else {
             self.controller.reset();
             let lang = config::language_label(&self.cfg.general.language);
             self.notice(format!("No {lang} model yet — opening settings"), true);
@@ -785,10 +964,10 @@ impl Daemon {
                     "recording ({}, {}{})",
                     model.id,
                     self.cfg.advanced.microphone_label(),
-                    if self.target == Target::Agent {
-                        ", for the agent"
-                    } else {
-                        ""
+                    match self.target {
+                        Target::Agent => ", for the agent",
+                        Target::Command => ", for a command",
+                        Target::Text => "",
                     }
                 ));
                 self.publish();
@@ -821,14 +1000,9 @@ impl Daemon {
             return;
         };
         let (tx, rx) = mpsc::channel();
-        self.engine.send(Job::Transcribe(engine::Request {
-            samples: speech.to_vec(),
-            model,
-            prompt: text::prompt(&self.cfg.vocabulary.words, model.language),
-            threads: self.cfg.threads(),
-            full_window: false,
-            reply: tx,
-        }));
+        self.prepare_retry(speech, model);
+        let request = self.transcribe_request(speech.to_vec(), model, tx);
+        self.engine.send(Job::Transcribe(request));
         self.phase = Phase::Transcribing {
             rx,
             started: Instant::now(),
@@ -854,6 +1028,15 @@ impl Daemon {
             self.ungrab_confirm();
             log("agent message cancelled".into());
         }
+        if let Phase::CommandConfirm { lang, .. } = self.phase {
+            self.phase = Phase::Idle;
+            self.ungrab_confirm();
+            log("voice command cancelled".into());
+            self.controller.reset();
+            self.notice_private(command::text(lang, "cancelled"), false, 2);
+            self.publish();
+            return;
+        }
         self.controller.reset();
         self.hide();
         self.publish();
@@ -870,11 +1053,15 @@ impl Daemon {
 
     fn notice(&mut self, text: String, error: bool) {
         log(format!("notice: {text}"));
+        self.notice_private(text, error, if error { 4 } else { 2 });
+    }
+
+    /// A notice that is not logged (it may contain what the user said).
+    fn notice_private(&mut self, text: String, error: bool, secs: u64) {
         if !self.cfg.general.overlay {
             self.hide();
             return;
         }
-        let secs = if error { 4 } else { 2 };
         self.message = Some((
             View::Message { text, error },
             Instant::now() + Duration::from_secs(secs),
@@ -939,8 +1126,16 @@ impl Daemon {
                     false
                 }
             });
+        while let Ok(outcome) = self.command_done.try_recv() {
+            self.command_outcome(outcome);
+        }
         match &mut self.phase {
             Phase::Idle => while self.agent_done.try_recv().is_ok() {},
+            Phase::CommandConfirm { until, .. } => {
+                if Instant::now() >= *until {
+                    self.cancel();
+                }
+            }
             Phase::Confirming { until, .. } => {
                 if Instant::now() >= *until {
                     self.send_to_agent();
@@ -1031,15 +1226,25 @@ impl Daemon {
         let agent = self.target == Target::Agent;
         let options = text::Options {
             capitalize: self.cfg.output.capitalize,
-            trailing_space: self.cfg.output.trailing_space && !agent,
+            trailing_space: self.cfg.output.trailing_space && self.target == Target::Text,
         };
         let Some(text) = text::finish(&transcript.text, options) else {
             self.phase = Phase::Idle;
-            self.notice("No speech recognised".into(), false);
+            if self.target == Target::Command {
+                self.cue(Cue::Error);
+                let lang = Lang::from_code(&self.cfg.general.language);
+                self.notice_private(command::text(lang, "not-understood"), true, 2);
+            } else {
+                self.notice("No speech recognised".into(), false);
+            }
             self.publish();
             return;
         };
         crate::measure::record(&transcript);
+        if self.target == Target::Command {
+            self.heard_command(&transcript, text.trim());
+            return;
+        }
         if agent {
             self.confirm(transcript, text.trim().to_string());
             return;
@@ -1194,6 +1399,153 @@ impl Daemon {
         }
     }
 
+    // ── command mode ──────────────────────────────────────────────────────
+
+    /// Match what was heard; run it, ask first, or say it was not understood.
+    fn heard_command(&mut self, transcript: &Transcript, heard: &str) {
+        self.phase = Phase::Idle;
+        let prefer = transcript
+            .detected
+            .as_deref()
+            .filter(|d| *d == "sv" || *d == "en")
+            .map(Lang::from_code)
+            .unwrap_or_else(|| Lang::from_code(&self.cfg.general.language));
+        let Some(parsed) = command::parse(heard, prefer) else {
+            if self.command_retry.is_some() && self.command_first_heard.is_none() {
+                self.command_first_heard = Some(heard.to_string());
+            }
+            if self.retry_command() {
+                return;
+            }
+            // The dictation language's text says best what was heard.
+            let first = self.command_first_heard.take();
+            let heard = first.as_deref().unwrap_or(heard);
+            // What was said is never logged; only that it did not match.
+            log(format!(
+                "voice command not understood ({} words, {:.2} s)",
+                heard.split_whitespace().count(),
+                transcript.seconds + transcript.load_seconds
+            ));
+            self.cue(Cue::Error);
+            let lang = command::guess_lang(heard, prefer);
+            self.notice_private(command::not_understood(lang, heard), true, 2);
+            self.publish();
+            return;
+        };
+        self.command_retry = None;
+        self.command_first_heard = None;
+        log(format!(
+            "voice command: {} ({:.2} s)",
+            parsed.intent.name(),
+            transcript.seconds + transcript.load_seconds
+        ));
+        if parsed.intent.dangerous() && self.cfg.command.confirm_dangerous {
+            if !self.cfg.general.overlay {
+                // Without the box nothing can be confirmed; never run it blind.
+                self.cue(Cue::Error);
+                log("a dangerous voice command needs the overlay to confirm; not run".into());
+                self.publish();
+                return;
+            }
+            self.phase = Phase::CommandConfirm {
+                intent: parsed.intent,
+                lang: parsed.lang,
+                until: Instant::now() + COMMAND_CONFIRM,
+            };
+            self.message = None;
+            self.grab_confirm();
+            self.palette = Some(self.resolve_palette());
+            self.publish();
+            self.draw();
+            return;
+        }
+        self.run_command(parsed.intent, parsed.lang);
+    }
+
+    fn confirm_command(&mut self) {
+        let Phase::CommandConfirm { intent, lang, .. } =
+            std::mem::replace(&mut self.phase, Phase::Idle)
+        else {
+            return;
+        };
+        self.ungrab_confirm();
+        self.run_command(intent, lang);
+    }
+
+    /// Start the plan on a worker thread; its outcome comes back to `tick`.
+    fn run_command(&mut self, intent: Intent, lang: Lang) {
+        let plan = intent.plan();
+        if plan.hide_overlay {
+            self.message = None;
+            self.hide();
+        } else {
+            self.notice_private(intent.say(lang), false, 2);
+        }
+        let tx = self.command_tx.clone();
+        let waker = self.waker.clone();
+        let spawned = thread::Builder::new()
+            .name("nirudictate-command".into())
+            .spawn(move || {
+                let result = runner::run(&plan);
+                let _ = tx.send(CommandOutcome {
+                    intent,
+                    lang,
+                    result,
+                });
+                waker.wake();
+            });
+        if spawned.is_err() {
+            self.fail("cannot start the command".into());
+        }
+        self.publish();
+    }
+
+    fn command_outcome(&mut self, outcome: CommandOutcome) {
+        let CommandOutcome {
+            intent,
+            lang,
+            result,
+        } = outcome;
+        let showing = matches!(self.phase, Phase::Idle) && self.message.is_some();
+        match result {
+            Ok(done) => {
+                self.cue(Cue::Done);
+                match done {
+                    Done::Launched(name) if showing && !name.is_empty() => {
+                        self.notice_private(Intent::OpenApp(name).say(lang), false, 2);
+                    }
+                    // The launcher's own window shows the choice.
+                    Done::Shown if showing => {
+                        self.message = None;
+                        self.hide();
+                    }
+                    Done::Ran if showing && matches!(intent, Intent::Note(_)) => {
+                        self.notice_private(command::text(lang, "note-saved"), false, 2);
+                    }
+                    _ => {}
+                }
+            }
+            Err(fail) => {
+                log(format!("voice command {} failed: {fail:?}", intent.name()));
+                self.cue(Cue::Error);
+                let text = failure_text(&fail, lang);
+                if matches!(self.phase, Phase::Idle) {
+                    self.notice_private(text, true, 4);
+                }
+            }
+        }
+    }
+
+    fn command_status(&self) -> CommandStatus {
+        CommandStatus {
+            enabled: self.cfg.command.enabled,
+            shortcut: self.cfg.command.key.clone(),
+            shortcut_active: !self.command_grabbed.is_empty(),
+            problem: self.command_error.clone(),
+            language: self.cfg.command.language.clone(),
+        }
+    }
+
     fn agent_status(&self) -> AgentStatus {
         AgentStatus {
             enabled: self.cfg.agent.enabled,
@@ -1235,25 +1587,43 @@ impl Daemon {
                 Some(View::Recording {
                     seconds: capture.elapsed().as_secs_f32(),
                     levels,
-                    language: self.language(),
+                    language: match (self.target, self.cfg.command.language.as_str()) {
+                        (Target::Command, "auto" | "both") => "sv/en".into(),
+                        (Target::Command, "sv" | "en") => self.cfg.command.language.clone(),
+                        _ => self.language(),
+                    },
                     holding: self.controller.holding(),
                     agent: self.target == Target::Agent,
                     fresh: self.fresh,
+                    command: self.target == Target::Command,
                 })
             }
             Phase::Confirming {
                 text, until, total, ..
             } => Some(View::Confirm {
+                title: if self.fresh {
+                    "To opencode · new conversation".into()
+                } else {
+                    "To opencode".into()
+                },
                 text: text.clone(),
-                left: if total.is_zero() {
+                hint: "Enter sends now · Esc cancels".into(),
+                left: Some(if total.is_zero() {
                     0.0
                 } else {
                     until
                         .saturating_duration_since(Instant::now())
                         .as_secs_f32()
                         / total.as_secs_f32()
-                },
-                fresh: self.fresh,
+                }),
+                warning: false,
+            }),
+            Phase::CommandConfirm { intent, lang, .. } => Some(View::Confirm {
+                title: command::text(*lang, "title"),
+                text: intent.question(*lang),
+                hint: command::text(*lang, "confirm-hint"),
+                left: None,
+                warning: true,
             }),
             Phase::Sending { started, .. } => Some(View::Sending {
                 phase: started.elapsed().as_secs_f32(),
@@ -1312,8 +1682,12 @@ impl Daemon {
     fn publish(&mut self) {
         let word = self.phase.word();
         let lang = self.language();
-        let agent = self.target == Target::Agent && !matches!(self.phase, Phase::Idle);
-        live::write(word, &lang, agent);
+        let target = if matches!(self.phase, Phase::Idle) {
+            None
+        } else {
+            self.target.word()
+        };
+        live::write(word, &lang, target);
         let _ = self.conn.change_property8(
             PropMode::REPLACE,
             self.root,
@@ -1347,6 +1721,7 @@ impl Daemon {
             last: self.last.clone(),
             error: self.shortcut_error.clone().or_else(|| self.error.clone()),
             agent: Some(self.agent_status()),
+            command: Some(self.command_status()),
         }
     }
 
@@ -1421,6 +1796,50 @@ impl Daemon {
                 }
                 self.ok_status()
             }
+            Request::CommandToggle => {
+                if matches!(self.phase, Phase::Recording { .. }) {
+                    self.stop();
+                } else if matches!(self.phase, Phase::Idle) {
+                    self.target = Target::Command;
+                    self.start();
+                    if matches!(self.phase, Phase::Recording { .. }) {
+                        self.controller.started_elsewhere();
+                    }
+                }
+                self.ok_status()
+            }
+            Request::CommandConfirm => {
+                self.confirm_command();
+                self.ok_status()
+            }
+            Request::CommandFile { path } => {
+                if !matches!(self.phase, Phase::Idle) {
+                    Reply::error("NIRUDICTATE is busy")
+                } else {
+                    match (
+                        command_model(&self.cfg, &self.hw),
+                        audio::read_wav(std::path::Path::new(&path)),
+                    ) {
+                        (None, _) => Reply::error("no installed model"),
+                        (_, Err(e)) => Reply::error(e),
+                        (Some(model), Ok(samples)) => {
+                            let (tx, rx) = mpsc::channel();
+                            self.target = Target::Command;
+                            self.prepare_retry(&samples, model);
+                            let request = self.transcribe_request(samples, model, tx);
+                            self.engine.send(Job::Transcribe(request));
+                            self.palette = Some(self.resolve_palette());
+                            self.phase = Phase::Transcribing {
+                                rx,
+                                started: Instant::now(),
+                            };
+                            self.publish();
+                            self.draw();
+                            self.ok_status()
+                        }
+                    }
+                }
+            }
             Request::AgentNew => {
                 if self.target == Target::Agent && !matches!(self.phase, Phase::Idle) {
                     self.fresh = true;
@@ -1459,6 +1878,7 @@ impl Daemon {
                                 prompt: text::prompt(&self.cfg.vocabulary.words, model.language),
                                 threads: self.cfg.threads(),
                                 full_window: false,
+                                language: None,
                                 reply: tx,
                             }));
                             self.target = Target::Agent;
@@ -1516,6 +1936,7 @@ impl Daemon {
                             prompt: text::prompt(&self.cfg.vocabulary.words, model.language),
                             threads: self.cfg.threads(),
                             full_window: false,
+                            language: None,
                             reply: tx,
                         }));
                         self.pending_files.push((reply, rx));
@@ -1534,5 +1955,50 @@ impl Daemon {
             status: Some(self.status()),
             ..Reply::default()
         }
+    }
+}
+
+/// The models command mode tries, in order: the dictation language's, then
+/// for `both` the other language's when it is installed; or the one
+/// `[command] language` names (falling back to the dictation model).
+pub fn command_models(cfg: &Config, hw: &Hardware) -> Vec<&'static Model> {
+    let for_lang = |lang: &str| models::active(lang, cfg.model_for(lang), hw);
+    let dictation = &cfg.general.language;
+    let mut out: Vec<&'static Model> = Vec::new();
+    match cfg.command.language.as_str() {
+        lang @ ("sv" | "en") => out.extend(for_lang(lang).or_else(|| for_lang(dictation))),
+        "both" => {
+            out.extend(for_lang(dictation));
+            let other = if dictation == "sv" { "en" } else { "sv" };
+            out.extend(for_lang(other));
+        }
+        _ => out.extend(for_lang(dictation)),
+    }
+    out
+}
+
+/// The first model command mode listens with.
+pub fn command_model(cfg: &Config, hw: &Hardware) -> Option<&'static Model> {
+    command_models(cfg, hw).into_iter().next()
+}
+
+/// The language override for whisper in command mode.
+pub fn command_language(cfg: &Config) -> Option<String> {
+    (cfg.command.language == "auto").then(|| "auto".to_string())
+}
+
+/// A failed command in the language it was spoken in.
+fn failure_text(fail: &Fail, lang: Lang) -> String {
+    match (fail, lang) {
+        (Fail::Missing(p), Lang::Sv) => format!("{p} är inte installerat"),
+        (Fail::Missing(p), Lang::En) => format!("{p} is not installed"),
+        (Fail::OldWm, Lang::Sv) => "Uppdatera NIRUWM: niructl saknar röstkommandon (do)".into(),
+        (Fail::OldWm, Lang::En) => "Update NIRUWM: niructl has no voice commands (do)".into(),
+        (Fail::OldLauncher, Lang::Sv) => {
+            "Uppdatera NIRULAUNCHER för att spara anteckningar med rösten".into()
+        }
+        (Fail::OldLauncher, Lang::En) => "Update NIRULAUNCHER to save notes by voice".into(),
+        (Fail::Failed(e), Lang::Sv) => format!("Gick inte: {e}"),
+        (Fail::Failed(e), Lang::En) => format!("Failed: {e}"),
     }
 }

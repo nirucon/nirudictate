@@ -39,7 +39,26 @@ pub enum Request {
     AgentFile {
         path: String,
     },
+    /// Command mode: start/stop listening for a voice command (Super+Alt+Space).
+    CommandToggle,
+    /// Transcribe a WAV file and act on it like a spoken command.
+    CommandFile {
+        path: String,
+    },
+    /// Run the command waiting in the confirmation box.
+    CommandConfirm,
     Quit,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CommandStatus {
+    pub enabled: bool,
+    pub shortcut: String,
+    pub shortcut_active: bool,
+    /// Why command mode is off or the shortcut is not grabbed.
+    pub problem: Option<String>,
+    /// What whisper listens for (`dictation`, `auto`, `sv`, `en`).
+    pub language: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -85,6 +104,9 @@ pub struct Status {
     /// Agent mode (0.2); absent from older services.
     #[serde(default)]
     pub agent: Option<AgentStatus>,
+    /// Command mode (0.3); absent from older services.
+    #[serde(default)]
+    pub command: Option<CommandStatus>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -175,11 +197,22 @@ mod tests {
                 path: "/a.wav".into()
             }
         );
+        assert_eq!(
+            serde_json::to_string(&Request::CommandToggle).unwrap(),
+            r#"{"cmd":"command-toggle"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"cmd":"command-file","path":"/c.wav"}"#).unwrap(),
+            Request::CommandFile {
+                path: "/c.wav".into()
+            }
+        );
         // A 0.1 status (no agent field) still reads.
         let old: Status = serde_json::from_str(
             r#"{"version":"0.1.0","state":"idle","pid":1,"language":"sv","model":null,"loaded":null,"recording_seconds":0.0,"shortcut":"ctrl+alt+space","shortcut_active":true,"mode":"hybrid","audio":"pw-record","engine":"x","last":null,"error":null}"#,
         )
         .unwrap();
         assert!(old.agent.is_none());
+        assert!(old.command.is_none());
     }
 }

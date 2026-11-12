@@ -358,6 +358,40 @@ impl Default for Agent {
 
 pub const TERMINALS: &[&str] = &["auto", "kitty", "alacritty", "xterm"];
 
+/// Command mode: a third shortcut whose speech is matched against a fixed
+/// list of desktop commands (see `command.rs`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Command {
+    /// Grab the command shortcut.
+    pub enabled: bool,
+    pub key: String,
+    /// Close window, suspend, restart, shut down and log out wait for Enter.
+    pub confirm_dangerous: bool,
+    /// Which models listen: `both` (the dictation language's model, then
+    /// the other language's when nothing matched and it is installed),
+    /// `dictation` (only the dictation model), `sv`, `en`, or `auto`
+    /// (whisper's language detection on the dictation model; measured
+    /// slower and no better, see docs/MEASUREMENTS.md).
+    pub language: String,
+    /// Name the programs you start most in whisper's prompt.
+    pub app_names: bool,
+}
+
+impl Default for Command {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            key: "super+alt+space".into(),
+            confirm_dangerous: true,
+            language: "both".into(),
+            app_names: true,
+        }
+    }
+}
+
+pub const COMMAND_LANGUAGES: &[&str] = &["both", "dictation", "sv", "en", "auto"];
+
 impl Agent {
     /// `directory` with `~` expanded.
     pub fn folder(&self) -> PathBuf {
@@ -383,6 +417,7 @@ pub struct Config {
     pub history: History,
     pub advanced: Advanced,
     pub agent: Agent,
+    pub command: Command,
 }
 
 pub const LANGUAGES: &[(&str, &str)] = &[("sv", "Swedish"), ("en", "English")];
@@ -429,6 +464,20 @@ impl Config {
             crate::hotkey::parse(&self.agent.key).map_err(|e| format!("agent.key: {e}"))?;
         if crate::hotkey::parse(&self.shortcut.key).ok() == Some(agent_key) {
             return Err("agent.key must differ from shortcut.key".into());
+        }
+        let command_key =
+            crate::hotkey::parse(&self.command.key).map_err(|e| format!("command.key: {e}"))?;
+        if crate::hotkey::parse(&self.shortcut.key).ok() == Some(command_key)
+            || agent_key == command_key
+        {
+            return Err("command.key must differ from shortcut.key and agent.key".into());
+        }
+        if !COMMAND_LANGUAGES.contains(&self.command.language.as_str()) {
+            return Err(format!(
+                "command.language must be one of {}, not {:?}",
+                COMMAND_LANGUAGES.join(", "),
+                self.command.language
+            ));
         }
         if !(0.0..=10.0).contains(&self.agent.confirm_seconds) {
             return Err("agent.confirm_seconds must be between 0 and 10".into());
@@ -567,6 +616,28 @@ mod tests {
         assert!(Config::parse("[agent]\ndirectory = \"relative/dir\"\n").is_err());
         assert!(Config::parse("[agent]\nagent = \"two words\"\n").is_err());
         assert!(Config::parse("[agent]\nauto = true\n").is_err());
+    }
+
+    #[test]
+    fn command_mode_defaults_and_checks() {
+        let cfg = Config::default();
+        assert!(cfg.command.enabled);
+        assert_eq!(cfg.command.key, "super+alt+space");
+        assert!(cfg.command.confirm_dangerous);
+        assert!(COMMAND_LANGUAGES.contains(&cfg.command.language.as_str()));
+        // A 0.2 file without [command] still loads.
+        assert_eq!(
+            Config::parse("[agent]\nenabled = false\n").unwrap().command,
+            Command::default()
+        );
+        let cfg =
+            Config::parse("[command]\nlanguage = \"auto\"\nconfirm_dangerous = false\n").unwrap();
+        assert_eq!(cfg.command.language, "auto");
+        assert!(!cfg.command.confirm_dangerous);
+        assert!(Config::parse("[command]\nkey = \"ctrl+alt+space\"\n").is_err());
+        assert!(Config::parse("[command]\nkey = \"shift+alt+space\"\n").is_err());
+        assert!(Config::parse("[command]\nlanguage = \"de\"\n").is_err());
+        assert!(Config::parse("[command]\nshell = true\n").is_err());
     }
 
     #[test]

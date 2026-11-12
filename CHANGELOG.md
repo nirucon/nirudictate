@@ -1,3 +1,63 @@
+# NIRUDICTATE 0.3.0
+
+Voice commands: control the desktop by voice, in Swedish or English.
+
+- **Super+Alt+Space** listens like the other shortcuts (tap and speak, it
+  stops after a pause; or hold while you speak). What you say is matched
+  against a fixed list of desktop commands and run: "öppna terminalen",
+  "open the browser", "gå till arbetsyta tre", "move the window to workspace
+  2", "lås skärmen", "höj volymen", "take a screenshot", "slå på nattljuset",
+  "anteckning köp mjölk", "sök efter väder", "öppna Spotify" and more
+  (`nirudictate command list`).
+- **Deterministic and local.** A table of phrase templates in both languages
+  (no language model): politeness and fillers are ignored, numbers work as
+  words, digits and ordinals, common Whisper mishearings are handled, and
+  English speech that KB-Whisper wrote in Swedish still matches. A phrase
+  must match as a whole; when in doubt nothing runs and the overlay says
+  "Förstod inte: …" / "Not understood: …" with the error sound.
+- **Only fixed actions**, each one program with fixed arguments, never a
+  shell: NIRUWM actions through `niructl do` (terminal, browser, workspaces,
+  move window, close, fullscreen, float, layouts, lock, launcher, search,
+  window jump, quick note, overview, next/previous screen), `niructl
+  nightlight` and `niructl dnd`, volume, mute and microphone, brightness,
+  `playerctl` media keys, `nirushot` screenshots, notes with
+  `nirulauncher --note --stdin`, web search with `nirulauncher --search`, and
+  any installed program with `nirulauncher --apps --query X --launch-best`.
+  "Browser" is always NIRUWM's browser setting.
+- **Dangerous commands ask first**: close window, suspend, restart, shut down
+  and log out show a themed box; Enter runs, Esc cancels, and it is dropped
+  after 15 s, never run by itself (`[command] confirm_dangerous`).
+- The overlay shows **CMD** while listening and what runs, in the language
+  that was spoken ("Öppnar terminal" / "Opening terminal").
+- Whisper gets a short hint with the command words and the programs you start
+  most from NIRULAUNCHER (`[command] app_names`).
+- **Both languages**: the dictation language's model listens first; when its
+  text matches no command and the other language's model is installed, the
+  same audio is tried with that one (`[command] language = "both"`, the
+  default; also `dictation`, `sv`, `en`, `auto`).
+- **Near misses**: when nothing matches word for word, one misheard word
+  (a letter or two off, a vowel, a split compound) may still match when the
+  words around it match exactly.
+- **Older NIRUWM or NIRULAUNCHER**: the command says "Update NIRUWM" or
+  "Update NIRULAUNCHER" in the overlay; lock screen and layouts fall back to
+  the older `niructl lock` and `niructl layout`.
+- New `[command]` settings (`enabled`, `key`, `confirm_dangerous`,
+  `language`, `app_names`) and a **Voice commands** tab in the panel. 0.2
+  config files load unchanged.
+- New CLI: `nirudictate command [status|toggle|list|file|confirm]` and
+  `nirudictate command --dry-run "TEXT"` or `--dry-run --file A.wav …`
+  (with `--language`, `--no-prompt`, `--json`) to test without a
+  window manager.
+- `doctor` checks the command shortcut against XKB layout switches
+  (`grp:win_space_toggle`, `grp:alt_space_toggle`) and NIRUWM's key bindings
+  (all three shortcuts), and whether `niructl do`, NIRULAUNCHER's new
+  options, `playerctl`, `wpctl` and `nirushot` are there.
+- The cheat sheet file (`keys.d/nirudictate.toml`) lists the command key.
+- Live state: `state.json` gains `"target":"command"` while listening for a
+  command (still `version: 1`); `status --json` gains a `command` object.
+- The log names the command ("voice command: workspace 3"), never what was
+  said.
+
 # NIRUDICTATE 0.2.1
 
 - **Cheat sheet registration.** The service writes

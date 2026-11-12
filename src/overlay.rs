@@ -29,16 +29,22 @@ pub enum View {
         /// Agent mode: `AI` (and `NEW` for a new conversation) by the language.
         agent: bool,
         fresh: bool,
+        /// Command mode: `CMD` by the language.
+        command: bool,
     },
     Transcribing {
         phase: f32,
     },
-    /// Agent mode: the transcript, sent by itself when `left` reaches 0.
+    /// A box that waits for Enter or Esc: the agent's transcript (sent by
+    /// itself when `left` reaches 0) or a dangerous voice command.
     Confirm {
+        title: String,
         text: String,
-        /// Share of the waiting time left, 1 → 0.
-        left: f32,
-        fresh: bool,
+        hint: String,
+        /// Share of the waiting time left, 1 → 0; None draws no countdown.
+        left: Option<f32>,
+        /// A warning (red dot): the command closes or powers something off.
+        warning: bool,
     },
     /// Agent mode: handing the message to opencode.
     Sending {
@@ -276,8 +282,15 @@ pub fn render(
 ) -> Canvas {
     let colors = Colors::from(palette, translucent);
     let s = scale;
-    if let View::Confirm { text, left, fresh } = view {
-        return render_confirm(text, *left, *fresh, &colors, font, s);
+    if let View::Confirm {
+        title,
+        text,
+        hint,
+        left,
+        warning,
+    } = view
+    {
+        return render_confirm(title, text, hint, *left, *warning, &colors, font, s);
     }
     let h = (44.0 * s).round();
     let w = match view {
@@ -307,6 +320,7 @@ pub fn render(
             holding,
             agent,
             fresh,
+            command,
         } => {
             // Pulsing red dot.
             let pulse = 0.65 + 0.35 * (seconds * std::f32::consts::TAU * 0.8).cos().abs();
@@ -315,7 +329,7 @@ pub fn render(
             c.circle(22.0 * s, mid, 6.5 * s, red);
             // Level meter: newest on the right (shorter when the agent label
             // needs the room).
-            let bars = if *agent { 18usize } else { 26 };
+            let bars = if *agent || *command { 18usize } else { 26 };
             let left = 40.0 * s;
             let bar_w = 3.0 * s;
             let gap = 2.4 * s;
@@ -341,8 +355,12 @@ pub fn render(
             let mut lw = text_width(font, lsize, &lang);
             let right = w - 18.0 * s;
             c.text(font, lsize, right - lw, mid + 4.0 * s, &lang, colors.muted);
-            if *agent {
-                let tag = if *fresh { "NEW AI" } else { "AI" };
+            if *agent || *command {
+                let tag = match (*command, *fresh) {
+                    (true, _) => "CMD",
+                    (false, true) => "NEW AI",
+                    (false, false) => "AI",
+                };
                 let tw = text_width(font, lsize, tag);
                 c.text(
                     font,
@@ -399,12 +417,15 @@ pub fn render(
     c
 }
 
-/// The agent's confirmation box: who it goes to, the transcript (up to four
-/// lines), the keys, and a bar that runs out when it sends by itself.
+/// The confirmation box: what it is about, the text (up to four lines), the
+/// keys, and for the agent a bar that runs out when it sends by itself.
+#[allow(clippy::too_many_arguments)]
 fn render_confirm(
+    title: &str,
     text: &str,
-    left: f32,
-    fresh: bool,
+    hint: &str,
+    left: Option<f32>,
+    warning: bool,
     colors: &Colors,
     font: &FontArc,
     s: f32,
@@ -423,12 +444,8 @@ fn render_confirm(
     c.rounded_rect(1.0 * s, 1.0 * s, w - 2.0 * s, h - 2.0 * s, r - s, colors.bg);
     let small = 12.0 * s;
     let mut y = pad + 11.0 * s;
-    c.circle(pad + 4.0 * s, y - 4.0 * s, 4.0 * s, colors.accent);
-    let title = if fresh {
-        "To opencode · new conversation"
-    } else {
-        "To opencode"
-    };
+    let dot = if warning { colors.red } else { colors.accent };
+    c.circle(pad + 4.0 * s, y - 4.0 * s, 4.0 * s, dot);
     c.text(font, small, pad + 14.0 * s, y, title, colors.muted);
     y += 8.0 * s;
     for line in &lines {
@@ -436,15 +453,16 @@ fn render_confirm(
         c.text(font, size, pad, y - 5.0 * s, line, colors.fg);
     }
     y += 12.0 * s;
-    let hint = "Enter sends now · Esc cancels";
     c.text(font, small, pad, y + 6.0 * s, hint, colors.muted);
     // The countdown: a thin bar along the bottom edge.
-    let bar_w = (w - 2.0 * pad) * left.clamp(0.0, 1.0);
-    let mut track = colors.muted;
-    track[3] = 0.25;
-    c.rounded_rect(pad, h - 9.0 * s, w - 2.0 * pad, 3.0 * s, 1.5 * s, track);
-    if bar_w > 0.5 {
-        c.rounded_rect(pad, h - 9.0 * s, bar_w, 3.0 * s, 1.5 * s, colors.accent);
+    if let Some(left) = left {
+        let bar_w = (w - 2.0 * pad) * left.clamp(0.0, 1.0);
+        let mut track = colors.muted;
+        track[3] = 0.25;
+        c.rounded_rect(pad, h - 9.0 * s, w - 2.0 * pad, 3.0 * s, 1.5 * s, track);
+        if bar_w > 0.5 {
+            c.rounded_rect(pad, h - 9.0 * s, bar_w, 3.0 * s, 1.5 * s, colors.accent);
+        }
     }
     c
 }
@@ -737,6 +755,7 @@ mod tests {
                 holding: true,
                 agent: false,
                 fresh: false,
+                command: false,
             },
             View::Recording {
                 seconds: 3.0,
@@ -745,6 +764,16 @@ mod tests {
                 holding: false,
                 agent: true,
                 fresh: true,
+                command: false,
+            },
+            View::Recording {
+                seconds: 1.0,
+                levels: vec![0.4],
+                language: "sv".into(),
+                holding: false,
+                agent: false,
+                fresh: false,
+                command: true,
             },
             View::Transcribing { phase: 0.3 },
             View::Sending { phase: 0.6 },
@@ -768,9 +797,11 @@ mod tests {
         let p = palette();
         let short = render(
             &View::Confirm {
+                title: "To opencode".into(),
                 text: "Hej".into(),
-                left: 1.0,
-                fresh: false,
+                hint: "Enter sends now · Esc cancels".into(),
+                left: Some(1.0),
+                warning: false,
             },
             &p,
             &font,
@@ -780,9 +811,11 @@ mod tests {
         let long_text = "Kan du titta på varför bygget misslyckas i nirubar och föreslå en ändring som gör testerna gröna igen utan att ändra beteendet för användaren, och sedan skriva en kort sammanfattning av vad du gjorde och varför det behövdes.".repeat(2);
         let long = render(
             &View::Confirm {
+                title: "To opencode · new conversation".into(),
                 text: long_text.clone(),
-                left: 0.5,
-                fresh: true,
+                hint: "Enter sends now · Esc cancels".into(),
+                left: Some(0.5),
+                warning: false,
             },
             &p,
             &font,

@@ -207,6 +207,12 @@ impl Model {
     pub fn whisper_language(&self) -> &'static str {
         self.language
     }
+
+    /// Whether the model can hear (and detect) other languages: KB-Whisper
+    /// keeps Whisper's multilingual vocabulary, the `.en` models do not.
+    pub fn multilingual(&self) -> bool {
+        self.family == Family::KbWhisper
+    }
 }
 
 pub fn human_size(bytes: u64) -> String {

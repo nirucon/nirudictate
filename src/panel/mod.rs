@@ -27,6 +27,7 @@ enum Tab {
     Models,
     Shortcut,
     Agent,
+    Commands,
     Output,
     Vocabulary,
     History,
@@ -38,6 +39,7 @@ const TABS: &[(Tab, &str)] = &[
     (Tab::Models, "Languages & Models"),
     (Tab::Shortcut, "Shortcut & Mode"),
     (Tab::Agent, "Agent mode"),
+    (Tab::Commands, "Voice commands"),
     (Tab::Output, "Output"),
     (Tab::Vocabulary, "Vocabulary"),
     (Tab::History, "History"),
@@ -76,6 +78,7 @@ struct App {
     terminals: String,
     capturing_shortcut: bool,
     capturing_agent: bool,
+    capturing_command: bool,
     agent_dir: String,
     agent_name: String,
     agent_program: String,
@@ -189,6 +192,7 @@ impl App {
             terminals,
             capturing_shortcut: false,
             capturing_agent: false,
+            capturing_command: false,
             agent_dir,
             agent_name,
             agent_program,
@@ -447,6 +451,7 @@ impl eframe::App for App {
                             Tab::Models => self.models_tab(ui, ctx),
                             Tab::Shortcut => self.shortcut_tab(ui, ctx),
                             Tab::Agent => self.agent_tab(ui, ctx),
+                            Tab::Commands => self.commands_tab(ui, ctx),
                             Tab::Output => self.output_tab(ui),
                             Tab::Vocabulary => self.vocabulary_tab(ui),
                             Tab::History => self.history_tab(ui, ctx),
@@ -511,6 +516,7 @@ impl App {
         self.tab = tab;
         self.capturing_shortcut = false;
         self.capturing_agent = false;
+        self.capturing_command = false;
         if tab == Tab::Agent {
             self.probe_opencode();
         }
@@ -1366,6 +1372,146 @@ impl App {
         });
     }
 
+    // ── Voice commands ────────────────────────────────────────────────────
+
+    fn commands_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = self.p();
+        self.heading(
+            ui,
+            "Voice commands",
+            "Say what to do in Swedish or English: \"öppna terminalen\", \"go to workspace 3\", \"lås skärmen\".",
+        );
+        let status = self.status().and_then(|s| s.command);
+        card(ui, &p, |ui| {
+            section_title(ui, &p, "Shortcut");
+            ui.checkbox(&mut self.cfg.command.enabled, "Use voice commands");
+            ui.horizontal_wrapped(|ui| {
+                if self.capturing_command {
+                    ui.label(
+                        RichText::new("Press the new combination… (Esc cancels)").color(p.accent),
+                    );
+                    if let Some(spec) = widgets::capture_shortcut(ctx) {
+                        let taken = [&self.cfg.shortcut.key, &self.cfg.agent.key]
+                            .iter()
+                            .any(|k| hotkey::parse(k).ok() == hotkey::parse(&spec).ok());
+                        if spec == "escape" {
+                            self.capturing_command = false;
+                        } else if hotkey::parse(&spec).is_ok() && !taken {
+                            self.cfg.command.key = spec;
+                            self.capturing_command = false;
+                        } else {
+                            self.toast(
+                                "Use a modifier with a key, different from the dictation and agent shortcuts",
+                                true,
+                            );
+                        }
+                    }
+                } else {
+                    widgets::keycaps(ui, &p, &self.cfg.command.key);
+                    if ui.button("Change…").clicked() {
+                        self.capturing_command = true;
+                    }
+                    if self.cfg.command.key != "super+alt+space" && ui.button("Default").clicked()
+                    {
+                        self.cfg.command.key = "super+alt+space".into();
+                    }
+                }
+            });
+            if let Some(c) = &status {
+                if self.cfg.command.enabled && (c.problem.is_some() || !c.shortcut_active) {
+                    ui.label(
+                        RichText::new(
+                            c.problem
+                                .clone()
+                                .unwrap_or_else(|| "The command shortcut is not active".into()),
+                        )
+                        .color(p.warning),
+                    );
+                }
+            }
+            ui.label(
+                RichText::new(format!(
+                    "Works like the dictation shortcut ({}): tap, say the command, and it runs after a short pause; or hold while you speak. Nothing else is ever run: only the commands listed below.",
+                    self.cfg.shortcut.mode.label()
+                ))
+                .size(12.0)
+                .color(p.muted),
+            );
+        });
+        ui.add_space(12.0);
+        card(ui, &p, |ui| {
+            section_title(ui, &p, "Listening");
+            let label = |l: &str| match l {
+                "both" => "Dictation language, then the other",
+                "auto" => "Detect the language (slower)",
+                "sv" => "Swedish",
+                "en" => "English",
+                _ => "Only the dictation language",
+            };
+            egui::Grid::new("command-lang")
+                .num_columns(2)
+                .spacing([18.0, 10.0])
+                .show(ui, |ui| {
+                    ui.label("Language");
+                    egui::ComboBox::from_id_salt("command-language")
+                        .selected_text(label(&self.cfg.command.language))
+                        .show_ui(ui, |ui| {
+                            for l in config::COMMAND_LANGUAGES {
+                                ui.selectable_value(
+                                    &mut self.cfg.command.language,
+                                    l.to_string(),
+                                    label(l),
+                                );
+                            }
+                        });
+                    ui.end_row();
+                });
+            ui.label(
+                RichText::new("With both models installed, a command that the dictation model did not understand is tried once more with the other language's model (Languages & Models). With the Swedish model alone, many English commands still work: they come out in Swedish and match.")
+                    .size(12.0)
+                    .color(p.muted),
+            );
+            ui.checkbox(
+                &mut self.cfg.command.app_names,
+                "Help the model with the names of the programs you start most",
+            );
+            ui.checkbox(
+                &mut self.cfg.command.confirm_dangerous,
+                "Ask before closing a window, suspending, restarting, shutting down or logging out",
+            );
+            if !self.cfg.command.confirm_dangerous {
+                ui.label(
+                    RichText::new("These run at once when they are understood.")
+                        .size(12.0)
+                        .color(p.warning),
+                );
+            }
+        });
+        ui.add_space(12.0);
+        card(ui, &p, |ui| {
+            section_title(ui, &p, "What you can say");
+            ui.label(
+                RichText::new("Politeness and fillers are fine (\"kan du\", \"snälla\", \"please\"). Numbers work as words or digits. When a command is not understood nothing runs.")
+                    .size(12.0)
+                    .color(p.muted),
+            );
+            ui.add_space(4.0);
+            let mut last = "";
+            for (lang, label, examples) in crate::command::phrase_list() {
+                if label != last {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(label).strong().color(p.foreground));
+                    last = label;
+                }
+                ui.label(
+                    RichText::new(format!("{}  {}", lang.code(), examples.join(" · ")))
+                        .size(12.0)
+                        .color(p.muted),
+                );
+            }
+        });
+    }
+
     // ── Output ────────────────────────────────────────────────────────────
 
     fn output_tab(&mut self, ui: &mut egui::Ui) {
@@ -1859,6 +2005,7 @@ pub fn run(tab: Option<&str>) -> Result<(), String> {
         "models" | "languages" => Tab::Models,
         "shortcut" | "mode" => Tab::Shortcut,
         "agent" => Tab::Agent,
+        "commands" | "command" | "voice" => Tab::Commands,
         "output" => Tab::Output,
         "vocabulary" => Tab::Vocabulary,
         "history" => Tab::History,

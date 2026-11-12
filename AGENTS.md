@@ -33,6 +33,13 @@ state, protocols) and `docs/TESTING.md` (how it was verified) first.
   `~/.local/share/nirudictate/models/`, history and measurements
   `~/.local/state/nirudictate/` (0600), socket and live state
   `$XDG_RUNTIME_DIR/nirudictate/`.
+- **Voice commands run only fixed actions.** `command.rs` maps a transcript
+  to an `Intent` with fixed rules (no language model) and each intent to one
+  program with fixed arguments; never a shell, never `niructl do shell`,
+  `start` or `quit`. Close window and the power actions ask first
+  (`confirm_dangerous`). When unsure, nothing runs. Every example phrase in
+  the rule table is a test; add a phrase there, not only in the README. Log
+  the intent's `name()`, never what was said (free text included).
 - Agent mode keeps opencode in NIRUWM scratchpad slot 9 through
   `_NIRUWM_COMMAND` 18 (a named window, not the focused one); never send the
   focused window anywhere.

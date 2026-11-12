@@ -1029,6 +1029,7 @@ pub fn conflicting_xkb_options(options: &str, key: &str) -> Vec<String> {
     let shift_alt =
         shortcut.mods & crate::hotkey::SHIFT != 0 && shortcut.mods & crate::hotkey::MOD1 != 0;
     let alt_space = shortcut.mods & crate::hotkey::MOD1 != 0 && shortcut.keysym == 0x20;
+    let win_space = shortcut.mods & crate::hotkey::MOD4 != 0 && shortcut.keysym == 0x20;
     options
         .split(',')
         .map(str::trim)
@@ -1044,6 +1045,7 @@ pub fn conflicting_xkb_options(options: &str, key: &str) -> Vec<String> {
                         | "lshift_lalt_toggle"
                 ))
                 || (alt_space && name == "alt_space_toggle")
+                || (win_space && name == "win_space_toggle")
         })
         .map(str::to_string)
         .collect()
@@ -1217,6 +1219,14 @@ mod tests {
         );
         assert!(conflicting_xkb_options("grp:alt_shift_toggle", "super+f9").is_empty());
         assert!(conflicting_xkb_options("grp:win_space_toggle", "shift+alt+space").is_empty());
+        assert_eq!(
+            conflicting_xkb_options("grp:win_space_toggle", "super+alt+space"),
+            ["grp:win_space_toggle"]
+        );
+        assert_eq!(
+            conflicting_xkb_options("grp:alt_space_toggle", "super+alt+space"),
+            ["grp:alt_space_toggle"]
+        );
         assert!(conflicting_xkb_options("", "shift+alt+space").is_empty());
     }
 }

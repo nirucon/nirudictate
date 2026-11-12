@@ -95,3 +95,33 @@ nirudictate bench file.wav sv-base sv-small
   `/api/info`, `OPENCODE_PASSWORD`) and `--help` on a 2.1.3 install; it was not
   run end to end.
 
+
+## Voice commands (0.3.0)
+
+- Unit tests: the matcher's table (over 400 Swedish and English phrasings,
+  each checked with both language preferences), what KB-Whisper writes for
+  English speech, real near misses from the measurements, over 50 phrases
+  that must run nothing, numbers in both languages, every example in the
+  rule table parsing to its own rule, the plans (argv, never a shell, never
+  `niructl do shell/start/quit`, dangerous ones ask), free text keeping the
+  original words, the runner (missing program, failure line, standard input,
+  `launched\tName`, an old `niructl`), the program list for the prompt, the
+  NIRUWM key clash check, the config, the cheat sheet file and the IPC wire
+  form.
+- Accuracy and latency with the real models: see
+  [MEASUREMENTS.md](MEASUREMENTS.md#voice-commands).
+- Isolated Xvfb on othala (`:57`, its own runtime, config, data and state
+  directories, sounds off, stub `niructl`, `nirulauncher`, `playerctl`,
+  `wpctl`, `nirushot` and `pw-record` that only log their arguments):
+  `nirudictate command file` with Piper clips → "Öppnar terminal" and
+  `niructl do terminal`; "Vad är klockan" → "Förstod inte: Vad är klockan?"
+  with nothing run; "Stäng av datorn" → the red confirmation box, Esc →
+  "Avbrutet"; "Shut down the computer" → the English box, `command confirm`
+  → `niructl shutdown`; "Open Thunderbird" → `nirulauncher --apps --query
+  Thunderbird --launch-best` and "Opening Spotify" from the stub's answer; a
+  `niructl` without `do` → "Uppdatera NIRUWM: niructl saknar röstkommandon
+  (do)"; `command toggle` → the recording pill with CMD. Screenshots were
+  checked by eye in the owner's theme.
+- Not tested end to end: the real `niructl do` and
+  `nirulauncher --launch-best`/`--note --stdin` (built in parallel); the code
+  follows the shared interface and falls back as described.

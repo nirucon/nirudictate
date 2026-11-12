@@ -118,6 +118,60 @@ waits for HTTP or a window:
 6. When the terminal exits, its waiter thread tells the agent thread, which
    stops the server. `quit` stops both.
 
+## Command mode
+
+A third grab (`[command] key`, default Super+Alt+Space) sets the target to
+`Command`; the same `Controller` handles it. The recording, trimming and
+engine are shared; only the engine request differs:
+
+- **Prompt.** `command::prompt`: a short sentence of command words in the
+  model's language plus up to 24 program names. The names come from the
+  XDG `.desktop` files (`apps.rs`), but only programs that appear in
+  NIRULAUNCHER's `usage.tsv`, most launched first, so the prompt stays short
+  (well under whisper's 224-token prompt limit).
+- **Language.** `[command] language`: `dictation` (the dictation model and
+  language, the default), `sv`/`en` (that language's model), or `auto`
+  (whisper's language detection on a multilingual model; KB-Whisper keeps
+  Whisper's multilingual vocabulary, the `.en` models do not). The detected
+  language comes back in `Transcript.detected`.
+
+`command.rs` is the matcher, pure and unit tested:
+
+1. Tokenise: lower case, å/ä/ö and accents folded, punctuation and
+   apostrophes dropped, `-` splits words, `%` and a letter after digits
+   (`3:e`, `50procent`) become their own tokens. The original words are
+   kept for free text.
+2. Clean: hesitations (`eh`, `öh`, `um`) and `snälla`/`please` anywhere;
+   leading politeness (`kan du`, `skulle du kunna`, `could you`, `hej`,
+   `och`) and trailing (`tack`, `nu`, `thanks`, `for me`); English
+   determiners for the English rules; Swedish infinitives after "kan du"
+   become imperatives (`stänga` → `stäng`).
+3. Match the rule table: templates of words, `(a|b)` groups, `[a|b]`
+   optional groups (longest alternative first), `{n}` numbers and `{text}`
+   free text, with backtracking, anchored at both ends. Rules without free
+   text are tried before rules with it, and each pass tries the preferred
+   language (the detected or dictation language) first, so words both
+   languages share answer in the user's language.
+4. Build the `Intent` and its `Plan`: argv (never a shell), standard input
+   (a note), whether it waits, whether it is dangerous, whether the overlay
+   hides first (screenshots, lock, overview, power), a delay (screenshots)
+   and a fallback argv for a `niructl` without `do`.
+
+Each rule carries example phrases; a test checks that every example parses
+to its rule, so `nirudictate command list` (and the manual) cannot drift.
+
+The daemon then either runs the plan on a short-lived worker thread
+(`runner.rs`) and shows `Intent::say` in the language that matched, or, for
+a dangerous intent, enters `CommandConfirm`: the confirmation box with Esc,
+Return and KP_Enter grabbed, no timer except a 15 s drop. The runner finds
+the program on PATH or in `~/.local/bin`, puts it in its own process group,
+waits at most 8 s (150 s for power actions, which may wait for polkit), reads
+the error output on a thread so a program it started can never block it, and
+reports `Missing`, `OldWm` (`Usage: niructl` from a `niructl` without `do`,
+after trying the fallback), `OldLauncher` (a note that did not finish) or the
+first error line. The outcome comes back through a channel and the wake
+pipe.
+
 ## State for others
 
 - `$XDG_RUNTIME_DIR/nirudictate/state.json` — `{"version":1,"state":…,"pid":…,

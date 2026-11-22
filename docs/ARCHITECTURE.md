@@ -2,7 +2,7 @@
 
 One binary, `nirudictate`, with three roles: the background **service**
 (`nirudictate daemon`, started by the session), the **control panel**
-(`nirudictate settings`, eframe/egui) and the **CLI** (everything else). The
+(`nirudictate settings`, x11rb and a software canvas) and the **CLI** (everything else). The
 CLI and the panel talk to the service over a Unix socket.
 
 ```
@@ -191,7 +191,34 @@ in `~/.local/lib/nirudictate/`).
 
 ## Panel
 
-eframe 0.29 with the glow renderer, X11 only. The theme module is NIRUAMP's:
-NIRUX theme files and `appearance.toml`, Omarchy's `colors.toml` outside the
-NIRU session, watched with inotify for live switching. Every change is saved
+Since 0.4 the panel uses no GUI framework (0.3 used eframe/egui with
+OpenGL): `src/gui/` is an X11 window (x11rb), a software canvas presented
+with MIT-SHM (`PutImage` without it), text with ab_glyph and a glyph cache,
+and a small immediate-mode UI (`gui/ui.rs`: labels, buttons, check boxes,
+radio buttons, sliders, numbers you drag or type, drop-down lists, text
+fields with selection and the clipboard, progress bars, cards, a scroll
+area, tooltips, toasts). Each frame the panel describes itself from its
+state, like egui did, so `panel/mod.rs` kept its structure.
+
+The event loop sleeps in `poll` on the X connection and an eventfd. Worker
+threads (status, theme watcher, downloads, the microphone test, the
+opencode probe, the microphone list) write to the eventfd when they have
+something new. Animations (the microphone level, the spinner) ask for one
+timed frame at a time, only while they run. The service status is fetched
+when `_NIRUDICTATE_STATE` changes on the root window (the service sets it on
+every change and deletes it when it exits), when the window gets the focus,
+and every 200 ms only while the service records or transcribes; 0.3 asked
+every second all the time.
+
+The theme module is NIRUAMP's: NIRUX theme files and `appearance.toml`,
+Omarchy's `colors.toml` outside the NIRU session, watched with inotify for
+live switching (palette, font and font size). Text is sized so the panel
+keeps the proportions it had with egui's font, whatever system font is used
+(`fonts.rs` tries known paths first, then `fc-match`). Every change is saved
 immediately (`config.toml`, atomic) and the service reloads it.
+
+`tests/xvfb.sh` runs the panel in a private Xvfb: first frame, memory, idle
+CPU, and the main interactions through xdotool, with widget positions from
+`NIRUDICTATE_HITS=FILE` (a test hook that writes every widget's label and
+centre after each frame). `NIRUDICTATE_TIMING=1` prints the first frame
+time.

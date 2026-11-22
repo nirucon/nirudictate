@@ -10,7 +10,7 @@
 //!
 //! The paths are `$HOME`-relative on purpose: Omarchy hard-codes them and does
 //! not follow `XDG_STATE_HOME`/`XDG_CONFIG_HOME` for its own state.
-use egui::Color32;
+use crate::color::Color32;
 use std::fs;
 use std::path::{Path, PathBuf};
 

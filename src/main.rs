@@ -2,10 +2,13 @@
 mod agent;
 mod apps;
 mod audio;
+mod color;
 mod command;
 mod config;
 mod daemon;
 mod engine;
+mod fonts;
+mod gui;
 mod hardware;
 mod history;
 mod hotkey;
@@ -115,6 +118,7 @@ Super+Alt+Space listens for a voice command in Swedish or English: \"öppna
 terminalen\", \"go to workspace 3\", \"lås skärmen\" (see command list).";
 
 fn main() -> ExitCode {
+    let _ = gui::START.set(std::time::Instant::now());
     use_baseline_engine_if_needed();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("settings");

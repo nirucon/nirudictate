@@ -125,3 +125,25 @@ nirudictate bench file.wav sv-base sv-small
 - Not tested end to end: the real `niructl do` and
   `nirulauncher --launch-best`/`--note --stdin` (built in parallel); the code
   follows the shared interface and falls back as described.
+
+## Control panel without egui (0.4.0)
+
+- Unit tests: the canvas (rounded rectangles, clipping, blending, lines),
+  text wrapping and ellipsis, the UI (a click is reported once, check boxes,
+  text fields with å and the cursor keys, rows that wrap inside a card, a
+  drop-down list that opens and picks), keysyms and dead keys, the shortcut
+  recorder (Super included), the window icon, and the overlay with the
+  system font (`NIRUDICTATE_OVERLAY_DUMP=DIR cargo test overlay` writes
+  every view as an image).
+- `tests/xvfb.sh target/release/nirudictate` in a private Xvfb (`:67`) on
+  othala, with its own HOME and XDG directories: first frame, memory and
+  idle CPU; one window only (a second start raises it); a check box, a radio
+  button and a slider save at once; recording Ctrl+Alt+D as the shortcut;
+  the vocabulary field (Return, BackSpace, å/ä/ö) and copying it to the
+  clipboard; the agent name field; the theme drop-down; the history check
+  box; and the service: started, the panel notices it through the root
+  property and stops showing **Start service**, both stay at 0 CPU while
+  idle (no polling), stopped, the panel notices that too.
+- Every tab was compared side by side with 0.3 in the same Xvfb, also in a
+  narrow window, with an open drop-down list and a tooltip.
+

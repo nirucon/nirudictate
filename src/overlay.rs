@@ -6,9 +6,9 @@
 //! are smooth and slightly transparent; without one the window is shaped), so
 //! the service needs no GPU context and stays a few megabytes in size. Clicks
 //! pass through it, and it never takes focus.
+use crate::color::Color32;
 use crate::theme::Palette;
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
-use egui::Color32;
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
@@ -467,21 +467,12 @@ fn render_confirm(
     c
 }
 
-pub fn font(appearance_font: Option<&std::path::Path>) -> FontArc {
-    if let Some(path) = appearance_font {
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Ok(f) = FontArc::try_from_vec(bytes) {
-                return f;
-            }
-        }
-    }
-    let defs = egui::FontDefinitions::default();
-    let data = defs
-        .font_data
-        .get("Ubuntu-Light")
-        .or_else(|| defs.font_data.values().next())
-        .expect("egui ships default fonts");
-    FontArc::try_from_vec(data.font.to_vec()).expect("valid default font")
+/// The overlay font: the NIRUX appearance font when set, else the system
+/// sans-serif. None only on a system without any usable font.
+pub fn font(appearance_font: Option<&std::path::Path>) -> Option<FontArc> {
+    appearance_font
+        .and_then(crate::fonts::read)
+        .or_else(|| crate::fonts::load(crate::fonts::Face::Sans))
 }
 
 /// The X11 window that shows the canvas.
@@ -743,9 +734,27 @@ mod tests {
         .palette
     }
 
+    /// `NIRUDICTATE_OVERLAY_DUMP=DIR cargo test` writes every view as a PPM
+    /// image (over black) for looking at.
+    fn dump(c: &Canvas) {
+        let Some(dir) = std::env::var_os("NIRUDICTATE_OVERLAY_DUMP") else {
+            return;
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let mut out = format!("P6 {} {} 255\n", c.w, c.h).into_bytes();
+        for p in &c.px {
+            for v in &p[..3] {
+                out.push((v.clamp(0.0, 1.0) * 255.0) as u8);
+            }
+        }
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("view{n}.ppm")), out);
+    }
+
     #[test]
     fn renders_every_view_inside_its_pill() {
-        let font = font(None);
+        let font = font(None).expect("a system font");
         let p = palette();
         for view in [
             View::Recording {
@@ -783,6 +792,7 @@ mod tests {
             },
         ] {
             let c = render(&view, &p, &font, 1.0, true);
+            dump(&c);
             assert_eq!(c.h, 44);
             // Corners are transparent, the middle is painted.
             assert!(c.px[0][3] < 0.05);
@@ -793,7 +803,7 @@ mod tests {
 
     #[test]
     fn the_confirm_box_wraps_and_counts_down() {
-        let font = font(None);
+        let font = font(None).expect("a system font");
         let p = palette();
         let short = render(
             &View::Confirm {
@@ -822,6 +832,7 @@ mod tests {
             1.0,
             true,
         );
+        dump(&long);
         assert_eq!(short.w, 460);
         assert!(long.h > short.h, "more lines, taller box");
         assert!(long.h < 260, "at most four lines");

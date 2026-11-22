@@ -8,9 +8,9 @@
 //! appearance contract can override semantic colours. Invalid appearance data
 //! is ignored, while a malformed custom theme is reported without replacing the
 //! working appearance.
+use crate::color::Color32;
 use crate::config::config_home;
 use crate::{omarchy, session};
-use egui::Color32;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -684,102 +684,15 @@ pub fn available_themes() -> Vec<(String, String)> {
     out
 }
 
-pub fn install_style(ctx: &egui::Context, theme: &ResolvedTheme, prefs: &Preferences) {
-    let p = theme.palette;
-    let mut visuals = if p.light {
-        egui::Visuals::light()
-    } else {
-        egui::Visuals::dark()
-    };
-    visuals.panel_fill = p.background;
-    visuals.window_fill = p.panel;
-    visuals.extreme_bg_color = p.inset;
-    visuals.faint_bg_color = p.surface;
-    visuals.code_bg_color = p.inset;
-    visuals.selection.bg_fill = p.selected;
-    visuals.selection.stroke = egui::Stroke::new(1.0_f32, p.foreground);
-    visuals.hyperlink_color = p.accent;
-    visuals.warn_fg_color = p.warning;
-    visuals.error_fg_color = p.error;
-    visuals.window_stroke = egui::Stroke::new(1.0_f32, p.border);
-    visuals.widgets.noninteractive.bg_fill = p.surface;
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, p.foreground);
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, p.border);
-    visuals.widgets.inactive.bg_fill = p.surface_hi;
-    visuals.widgets.inactive.weak_bg_fill = p.surface;
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, p.foreground);
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, p.border);
-    visuals.widgets.hovered.bg_fill = blend(p.surface_hi, p.focus, 0.18);
-    visuals.widgets.hovered.weak_bg_fill = p.surface_hi;
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, p.foreground);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, p.focus);
-    visuals.widgets.active.bg_fill = p.selected;
-    visuals.widgets.active.weak_bg_fill = p.selected;
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, p.foreground);
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, p.focus);
-    visuals.widgets.open.bg_fill = p.surface_hi;
-    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, p.focus);
-    visuals.widgets.noninteractive.rounding = egui::Rounding::same(2.0);
-    visuals.widgets.inactive.rounding = egui::Rounding::same(2.0);
-    visuals.widgets.hovered.rounding = egui::Rounding::same(2.0);
-    visuals.widgets.active.rounding = egui::Rounding::same(2.0);
-    visuals.widgets.open.rounding = egui::Rounding::same(2.0);
-    visuals.window_rounding = egui::Rounding::same(3.0);
-    visuals.menu_rounding = egui::Rounding::same(2.0);
-    ctx.set_visuals(visuals);
-
-    let base = (theme.appearance.font_size * prefs.scale).clamp(10.0, 32.0);
-    let mut style = (*ctx.style()).clone();
-    style.text_styles = [
-        (
-            egui::TextStyle::Heading,
-            egui::FontId::proportional(base * 1.30),
-        ),
-        (egui::TextStyle::Body, egui::FontId::proportional(base)),
-        (egui::TextStyle::Monospace, egui::FontId::monospace(base)),
-        (egui::TextStyle::Button, egui::FontId::proportional(base)),
-        (
-            egui::TextStyle::Small,
-            egui::FontId::proportional(base * 0.80),
-        ),
-    ]
-    .into();
-    let gap = theme.appearance.gap * prefs.scale;
-    style.spacing.item_spacing = egui::vec2(gap, gap * 0.7);
-    style.spacing.button_padding = egui::vec2(gap, gap * 0.35);
-    style.spacing.window_margin = egui::Margin::same(theme.appearance.padding * prefs.scale);
-    style.animation_time = if theme.appearance.reduced_motion || prefs.reduced_motion == Some(true)
-    {
-        0.0
-    } else {
-        0.12
-    };
-    ctx.set_style(style);
-
-    if let Some(path) = theme.appearance.font_path.as_ref() {
-        if let Ok(bytes) = fs::read(path) {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("nirux-font".into(), egui::FontData::from_owned(bytes));
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts
-                    .families
-                    .entry(family)
-                    .or_default()
-                    .insert(0, "nirux-font".into());
-            }
-            ctx.set_fonts(fonts);
-        }
-    }
-}
-
 #[allow(dead_code)]
 pub fn reduced_motion(theme: &ResolvedTheme, prefs: &Preferences) -> bool {
     prefs
         .reduced_motion
         .unwrap_or(theme.appearance.reduced_motion)
 }
+
+/// Called by the watcher thread so the window wakes up for an event.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Debug)]
 pub enum ThemeEvent {
@@ -796,7 +709,8 @@ pub struct ThemeWatcher {
 }
 
 impl ThemeWatcher {
-    pub fn spawn(prefs: Arc<Mutex<Preferences>>, ctx: egui::Context) -> Self {
+    /// `wake` is called (from the watcher thread) after every event it sends.
+    pub fn spawn(prefs: Arc<Mutex<Preferences>>, waker: Waker) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let (tx, rx) = mpsc::channel();
@@ -810,10 +724,10 @@ impl ThemeWatcher {
                 let notify = wake_read.and_then(|r| Inotify::new().map(|i| (i, r)));
                 match notify {
                     Some((inotify, wake_read)) => {
-                        watch_inotify(prefs, ctx, tx, stop2, inotify, wake_read)
+                        watch_inotify(prefs, waker, tx, stop2, inotify, wake_read)
                     }
                     // Without inotify (or a pipe) fall back to the 0.3 timer.
-                    None => watch_loop(prefs, ctx, tx, stop2),
+                    None => watch_loop(prefs, waker, tx, stop2),
                 }
             })
             .ok();
@@ -967,7 +881,7 @@ fn watch_dirs(inotify: &Inotify) {
 
 fn watch_inotify(
     prefs: Arc<Mutex<Preferences>>,
-    ctx: egui::Context,
+    ctx: Waker,
     tx: Sender<ThemeEvent>,
     stop: Arc<AtomicBool>,
     inotify: Inotify,
@@ -1011,7 +925,7 @@ fn watch_inotify(
                 let _ = tx.send(ThemeEvent::Warning(e));
             }
         }
-        ctx.request_repaint();
+        ctx();
     }
 }
 
@@ -1062,7 +976,7 @@ fn fingerprint(prefs: &Preferences) -> Fingerprint {
 /// Timer fallback, used only when inotify is unavailable.
 fn watch_loop(
     prefs: Arc<Mutex<Preferences>>,
-    ctx: egui::Context,
+    ctx: Waker,
     tx: Sender<ThemeEvent>,
     stop: Arc<AtomicBool>,
 ) {
@@ -1094,7 +1008,7 @@ fn watch_loop(
                 let _ = tx.send(ThemeEvent::Warning(e));
             }
         }
-        ctx.request_repaint();
+        ctx();
     }
 }
 
@@ -1308,7 +1222,7 @@ mod tests {
         let initial = resolve(&Preferences::default()).unwrap();
         assert_eq!(initial.name, "niru-nord");
         let prefs = Arc::new(Mutex::new(Preferences::default()));
-        let ctx = egui::Context::default();
+        let ctx: Waker = Arc::new(|| {});
         let watcher = ThemeWatcher::spawn(prefs.clone(), ctx);
         thread::sleep(Duration::from_millis(1300));
         env.write("config.toml", "theme = \"niru-satie\"\n");
@@ -1346,7 +1260,7 @@ mod tests {
         let env = TempEnv::new("watch-late");
         let _ = fs::remove_dir_all(env.dir());
         let prefs = Arc::new(Mutex::new(Preferences::default()));
-        let watcher = ThemeWatcher::spawn(prefs, egui::Context::default());
+        let watcher = ThemeWatcher::spawn(prefs, Arc::new(|| {}));
         thread::sleep(Duration::from_millis(200));
         assert!(watcher.rx.try_recv().is_err(), "no event without a change");
         env.write("config.toml", "theme = \"niru-satie\"\n");
@@ -1447,7 +1361,7 @@ mod tests {
         let env = TempEnv::new("omarchy-watch");
         env.omarchy("tokyo-night", OMARCHY_TOKYO);
         let prefs = Arc::new(Mutex::new(Preferences::default()));
-        let watcher = ThemeWatcher::spawn(prefs, egui::Context::default());
+        let watcher = ThemeWatcher::spawn(prefs, Arc::new(|| {}));
         thread::sleep(Duration::from_millis(300));
         env.omarchy("catppuccin-latte", OMARCHY_LATTE);
         let deadline = Instant::now() + Duration::from_secs(6);

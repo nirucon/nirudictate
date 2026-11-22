@@ -26,9 +26,7 @@ jobs:
       - name: System build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libxkbcommon-dev libxkbcommon-x11-dev libx11-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libgl1-mesa-dev
+          sudo apt-get install -y cmake fonts-dejavu-core
       - name: Check the tag matches Cargo.toml
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
@@ -70,6 +68,7 @@ jobs:
         with:
           name: nirudictate-dry-run
           path: dist/*
+          retention-days: 1
       - name: Publish
         if: github.ref_type == 'tag'
         env:

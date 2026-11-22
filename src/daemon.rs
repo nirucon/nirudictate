@@ -485,6 +485,17 @@ impl Daemon {
             }
             self.tick();
             let _ = self.conn.flush();
+            // An event that arrived while a request above waited for its
+            // reply is already read from the socket: poll would not see it
+            // (a lost key release would leave push-to-talk recording).
+            match self.conn.poll_for_event() {
+                Ok(Some(event)) => {
+                    self.event(event);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => return Err(format!("X connection closed: {e}")),
+            }
             let timeout = self.timeout_ms();
             let mut fds = [
                 libc::pollfd {
@@ -1654,7 +1665,16 @@ impl Daemon {
             }
         }
         if self.font.is_none() {
-            self.font = Some(overlay::font(None));
+            // Looked up once: a system without fonts shows no overlay.
+            static TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if TRIED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            self.font = overlay::font(None);
+            if self.font.is_none() {
+                eprintln!("nirudictate: overlay unavailable: no usable font");
+                return;
+            }
         }
         let palette = match self.palette {
             Some(p) => p,

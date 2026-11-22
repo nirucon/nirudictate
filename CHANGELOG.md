@@ -1,3 +1,35 @@
+# NIRUDICTATE 0.4.0
+
+The control panel without a GUI framework: fast and light like NIRUFM and
+NIRUTERM.
+
+- **The panel is drawn in software on X11** (x11rb, its own small UI, MIT-SHM)
+  instead of eframe/egui with OpenGL. First frame in 7 to 19 ms instead of
+  about 90 ms, 13.5 MB of memory instead of 114 to 120 MB, and a 5.7 MB
+  binary instead of 11.7 MB. eframe, egui, winit and glow are gone; no OpenGL or
+  libxkbcommon is needed.
+- **Everything works as before**: every tab, setting, button and text field,
+  the shortcut recorder, model downloads with progress, the microphone test
+  with its level meter, copying the last dictation or a history entry, the
+  narrow layout with tabs at the top, the live NIRUX/Omarchy theme, one
+  window only, `nirudictate settings TAB`. The look and the proportions are
+  the same; headings are now bold.
+- **No polling**: the panel asked the service for its status every second;
+  now it follows the service's `_NIRUDICTATE_STATE` root property and the
+  window focus, and asks every 200 ms only while a dictation runs. Idle, the
+  panel and the service use no CPU at all.
+- The shortcut recorder accepts **Super** (the voice command default is
+  Super+Alt+Space), and text fields compose dead keys (é, ü).
+- Numbers such as "keep the last N dictations" can be dragged, scrolled or
+  clicked and typed; sliders also follow the mouse wheel.
+- The overlay uses the system font (it carried egui's font before).
+- Fix: the service could miss an X event (such as the key release that ends
+  push-to-talk) that arrived while it waited for a reply from the X server;
+  it now handles queued events before it sleeps.
+- `tests/xvfb.sh`: an end-to-end test of the panel in a private Xvfb.
+- The recognition pipeline, the files, the settings and the command line
+  are unchanged.
+
 # NIRUDICTATE 0.3.0
 
 Voice commands: control the desktop by voice, in Swedish or English.

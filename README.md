@@ -97,7 +97,8 @@ take the paste, the text is typed instead. See
 
 - x86_64 with Debian 12/13, Arch or Void (glibc 2.35 or newer).
 - X11 (NIRUWM or any other X11 desktop) with XTest.
-- OpenGL and `libxkbcommon-x11` for the panel (every NIRUX install has them).
+- A TrueType font for the panel and the overlay (DejaVu, Noto or Liberation;
+  every desktop has one). No OpenGL and no GUI toolkit are needed.
 - A recorder: `pw-record` (PipeWire), or `parec`/`arecord` without PipeWire.
 - Voice commands: NIRUWM with `niructl do` for the window, workspace,
   terminal and browser commands, and NIRULAUNCHER with `--launch-best` and
@@ -368,6 +369,21 @@ change is saved at once.
 - **History**: the last dictations, copy or delete one, clear all.
 - **Advanced**: microphone, threads, priority, keeping the model loaded,
   theme, autostart, and the service.
+
+The panel is drawn in software on X11 (x11rb, its own small UI, MIT-SHM),
+like NIRUFM and NIRUTERM: no GPU context and no GUI framework. It sleeps
+until something happens: a key, the mouse, the service changing state (the
+`_NIRUDICTATE_STATE` root property), a download or the microphone test.
+Measured on othala in the same private Xvfb, release builds:
+
+| | 0.3 (eframe/egui, OpenGL) | 0.4 (x11rb, software) |
+|---|---|---|
+| Panel: first frame | 87 ms (window mapped after 134 to 231 ms) | 7 to 19 ms (mapped after 4 to 12 ms) |
+| Panel: memory (RSS) | 114 to 120 MB | 13.5 MB (14.1 MB after visiting every tab) |
+| Panel: idle CPU | 0 ticks in 10 s (polled the service every second) | 0 ticks in 10 s, no polling |
+| Service (idle): memory | 7.8 MB | 6.5 to 7.1 MB |
+| Service (idle): CPU | 0 ticks in 10 s | 0 ticks in 10 s |
+| Binary | 11.7 MB | 5.7 MB |
 
 ### Command line
 

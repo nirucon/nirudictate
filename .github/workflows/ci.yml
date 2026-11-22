@@ -5,9 +5,9 @@ on:
   pull_request:
 
 env:
+  # whisper.cpp needs cmake; the tests draw text with a system font.
   SYSTEM_DEPS: >-
-    cmake libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libxcb1-dev
-    libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
+    cmake fonts-dejavu-core
 
 jobs:
   rust:

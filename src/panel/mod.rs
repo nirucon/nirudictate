@@ -7,19 +7,19 @@ mod widgets;
 use crate::audio::{self, Capture};
 use crate::config::{self, Config, Method, Mode};
 use crate::engine::Transcript;
+use crate::gui::ui::{red, Ctx, Rt, Ui};
+use crate::gui::{self, Outside, Waker};
 use crate::hardware::{self, Hardware};
 use crate::ipc::{self, Request, Status};
 use crate::models::{self, Model, Progress};
 use crate::theme::{self, Preferences, ResolvedTheme, ThemeEvent, ThemeWatcher};
 use crate::{history, hotkey, measure, text};
-use egui::RichText;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use widgets::{card, chip, level_meter, section_title};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
@@ -63,16 +63,17 @@ struct App {
     save_error: Option<String>,
     prefs: Arc<Mutex<Preferences>>,
     theme: ResolvedTheme,
-    _watcher: ThemeWatcher,
+    watcher: ThemeWatcher,
+    wake: Waker,
     tab: Tab,
     status: Arc<Mutex<Option<Status>>>,
-    polling: Arc<AtomicBool>,
+    refresh: Sender<()>,
     hw: Hardware,
     measured: Option<f32>,
     downloads: HashMap<&'static str, Download>,
     mic: Option<MicTest>,
     mic_result: Option<Result<Transcript, String>>,
-    devices: Vec<audio::Device>,
+    devices: Arc<Mutex<Vec<audio::Device>>>,
     history: Vec<history::Entry>,
     vocab: String,
     terminals: String,
@@ -87,29 +88,49 @@ struct App {
     confirm_delete: Option<&'static str>,
     toast: Option<(String, Instant, bool)>,
     themes: Vec<(String, String)>,
-    restyle_pending: bool,
+    scroll: f32,
+    scroll_drag: Option<(f32, f32)>,
+    last_tab: Tab,
+    font_path: Option<std::path::PathBuf>,
 }
 
-fn status_poller(status: Arc<Mutex<Option<Status>>>, run: Arc<AtomicBool>, ctx: egui::Context) {
+/// Asks the service for its status when told to (the service changed its
+/// root window property, the window got the focus, the panel did
+/// something), and every 200 ms only while it records or transcribes.
+fn status_thread(status: Arc<Mutex<Option<Status>>>, wake: Waker) -> Sender<()> {
+    let (tx, rx) = mpsc::channel::<()>();
     let _ = thread::Builder::new()
         .name("nirudictate-panel-status".into())
         .spawn(move || {
             let mut last: Option<Status> = None;
-            while run.load(Ordering::Relaxed) {
+            let mut busy = false;
+            loop {
+                let got = if busy {
+                    rx.recv_timeout(Duration::from_millis(200))
+                        .map_err(|e| matches!(e, mpsc::RecvTimeoutError::Disconnected))
+                } else {
+                    rx.recv().map_err(|_| true)
+                };
+                if got == Err(true) {
+                    return;
+                }
+                // Coalesce a burst of requests.
+                while rx.try_recv().is_ok() {}
                 let now = ipc::send(&Request::Status, Duration::from_millis(800))
                     .ok()
                     .and_then(|r| r.status);
-                let busy = now.as_ref().is_some_and(|s| s.state != "idle");
+                busy = now.as_ref().is_some_and(|s| s.state != "idle");
                 if now != last {
                     if let Ok(mut s) = status.lock() {
                         *s = now.clone();
                     }
-                    ctx.request_repaint();
+                    wake();
                     last = now;
                 }
-                thread::sleep(Duration::from_millis(if busy { 200 } else { 1000 }));
             }
         });
+    let _ = tx.send(());
+    tx
 }
 
 fn reload_service() {
@@ -146,47 +167,92 @@ fn start_service() -> Result<(), String> {
     Ok(())
 }
 
-impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let cfg = Config::load_or_default();
-        let prefs = Arc::new(Mutex::new(Preferences {
-            theme: cfg.general.theme.clone(),
-            ..Preferences::default()
-        }));
-        let theme = theme::resolve(&prefs.lock().expect("prefs").clone())
-            .or_else(|_| {
-                theme::resolve(&Preferences {
-                    theme: "classic".into(),
-                    ..Preferences::default()
-                })
+fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let p = ui.p();
+    ui.frame(p.surface, Some(p.border), 12.0, (18.0, 14.0), add)
+}
+
+fn section_title(ui: &mut Ui, text: &str) {
+    let p = ui.p();
+    ui.label(Rt::new(text).strong().size(15.0).color(p.foreground));
+}
+
+/// The label column of a form: its widest label and the gap after it.
+fn col(ui: &mut Ui, labels: &[&str]) -> f32 {
+    let body = ui.cx.body;
+    labels
+        .iter()
+        .map(|l| ui.cx.tw(crate::fonts::Face::Sans, body, l))
+        .fold(0.0, f32::max)
+        + 18.0
+}
+
+/// One row of a two-column form: the label column is `col` wide.
+fn grid_row(ui: &mut Ui, col: f32, label: &str, add: impl FnOnce(&mut Ui)) {
+    ui.horizontal_wrapped(|ui| {
+        let r = ui.label(label);
+        let pad = col - r.rect.w - crate::gui::ui::SPACING_X;
+        if pad > 0.0 {
+            ui.add_space(pad);
+        }
+        add(ui);
+    });
+}
+
+fn resolve_theme(prefs: &Preferences) -> ResolvedTheme {
+    theme::resolve(prefs)
+        .or_else(|_| {
+            theme::resolve(&Preferences {
+                theme: "classic".into(),
+                ..Preferences::default()
             })
-            .expect("classic theme");
-        theme::install_style(&cc.egui_ctx, &theme, &prefs.lock().expect("prefs"));
-        let watcher = ThemeWatcher::spawn(prefs.clone(), cc.egui_ctx.clone());
+        })
+        .expect("classic theme")
+}
+
+/// Load the microphone list off the UI thread (pw-dump takes a while).
+fn load_devices(slot: Arc<Mutex<Vec<audio::Device>>>, wake: Waker) {
+    let _ = thread::Builder::new()
+        .name("nirudictate-panel-devices".into())
+        .spawn(move || {
+            let list = audio::devices();
+            if let Ok(mut d) = slot.lock() {
+                *d = list;
+            }
+            wake();
+        });
+}
+
+impl App {
+    fn new(cfg: Config, prefs: Arc<Mutex<Preferences>>, theme: ResolvedTheme, wake: Waker) -> Self {
+        let watcher = ThemeWatcher::spawn(prefs.clone(), wake.clone());
         let status = Arc::new(Mutex::new(None));
-        let polling = Arc::new(AtomicBool::new(true));
-        status_poller(status.clone(), polling.clone(), cc.egui_ctx.clone());
+        let refresh = status_thread(status.clone(), wake.clone());
         let vocab = cfg.vocabulary.words.join("\n");
         let agent_dir = cfg.agent.directory.clone();
         let agent_name = cfg.agent.agent.clone();
         let agent_program = cfg.agent.opencode.clone();
         let terminals = cfg.output.terminals.join(", ");
+        let font_path = theme.appearance.font_path.clone();
+        let devices = Arc::new(Mutex::new(Vec::new()));
+        load_devices(devices.clone(), wake.clone());
         Self {
             saved: cfg.clone(),
             cfg,
             save_error: None,
             prefs,
             theme,
-            _watcher: watcher,
+            watcher,
+            wake,
             tab: Tab::Overview,
             status,
-            polling,
+            refresh,
             hw: hardware::detect(),
             measured: measure::load().tiny(),
             downloads: HashMap::new(),
             mic: None,
             mic_result: None,
-            devices: audio::devices(),
+            devices,
             history: history::load(),
             vocab,
             terminals,
@@ -201,7 +267,10 @@ impl App {
             confirm_delete: None,
             toast: None,
             themes: theme::available_themes(),
-            restyle_pending: true,
+            scroll: 0.0,
+            scroll_drag: None,
+            last_tab: Tab::Overview,
+            font_path,
         }
     }
 
@@ -211,6 +280,10 @@ impl App {
 
     fn toast(&mut self, text: impl Into<String>, error: bool) {
         self.toast = Some((text.into(), Instant::now(), error));
+    }
+
+    fn refresh_status(&self) {
+        let _ = self.refresh.send(());
     }
 
     /// Save changed settings and let the service reload them.
@@ -230,7 +303,6 @@ impl App {
                     }
                     if let Ok(t) = theme::resolve(&self.prefs.lock().expect("prefs").clone()) {
                         self.theme = t;
-                        self.restyle_pending = true;
                     }
                 }
             }
@@ -242,7 +314,7 @@ impl App {
         self.status.lock().ok().and_then(|s| s.clone())
     }
 
-    fn start_download(&mut self, model: &'static Model, ctx: &egui::Context) {
+    fn start_download(&mut self, model: &'static Model) {
         if self.downloads.contains_key(model.id) {
             return;
         }
@@ -254,25 +326,30 @@ impl App {
             cancel: Arc::new(AtomicBool::new(false)),
             done: Arc::new(Mutex::new(None)),
         };
-        let (p, c, done, ctx) = (
+        let (p, c, done, wake) = (
             d.progress.clone(),
             d.cancel.clone(),
             d.done.clone(),
-            ctx.clone(),
+            self.wake.clone(),
         );
         let _ = thread::Builder::new()
             .name("nirudictate-download".into())
             .spawn(move || {
+                // Progress wakes the window at most five times a second.
+                let mut shown = Instant::now() - Duration::from_secs(1);
                 let r = models::download(model, &c, |pr| {
                     if let Ok(mut x) = p.lock() {
                         *x = pr;
                     }
-                    ctx.request_repaint();
+                    if shown.elapsed() >= Duration::from_millis(200) {
+                        shown = Instant::now();
+                        wake();
+                    }
                 });
                 if let Ok(mut x) = done.lock() {
                     *x = Some(r);
                 }
-                ctx.request_repaint();
+                wake();
             });
         self.downloads.insert(model.id, d);
     }
@@ -305,9 +382,9 @@ impl App {
         }
     }
 
-    fn start_mic_test(&mut self, ctx: &egui::Context) {
-        let c = ctx.clone();
-        match Capture::start(&self.cfg.advanced.microphone, move || c.request_repaint()) {
+    fn start_mic_test(&mut self) {
+        let wake = self.wake.clone();
+        match Capture::start(&self.cfg.advanced.microphone, move || wake()) {
             Ok(capture) => {
                 self.mic_result = None;
                 self.mic = Some(MicTest::Recording {
@@ -319,7 +396,7 @@ impl App {
         }
     }
 
-    fn finish_mic_test(&mut self, ctx: &egui::Context) {
+    fn finish_mic_test(&mut self) {
         let Some(MicTest::Recording { capture, .. }) = self.mic.take() else {
             return;
         };
@@ -332,7 +409,7 @@ impl App {
         };
         let speech = speech.to_vec();
         let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
+        let wake = self.wake.clone();
         let cfg = self.cfg.clone();
         let hw = self.hw.clone();
         let _ = thread::Builder::new().spawn(move || {
@@ -367,34 +444,41 @@ impl App {
                 }
             })();
             let _ = tx.send(result);
-            ctx.request_repaint();
+            wake();
         });
         self.mic = Some(MicTest::Transcribing(rx));
     }
-}
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        while let Ok(event) = self._watcher.rx.try_recv() {
+    /// What `update` did before laying out: events from the workers.
+    fn before_frame(&mut self, cx: &mut Ctx) {
+        while let Ok(event) = self.watcher.rx.try_recv() {
             match event {
                 ThemeEvent::Updated(t) => {
                     self.theme = *t;
-                    self.restyle_pending = true;
                 }
                 ThemeEvent::Warning(w) => self.toast(w, true),
             }
         }
-        if self.restyle_pending {
-            self.restyle_pending = false;
-            theme::install_style(ctx, &self.theme, &self.prefs.lock().expect("prefs").clone());
-            widgets::tune_style(ctx, &self.theme.palette);
+        cx.p = self.theme.palette;
+        // The NIRUX appearance may change the font and its size live.
+        let body = (self.theme.appearance.font_size
+            * self.prefs.lock().map(|p| p.scale).unwrap_or(1.0))
+        .clamp(10.0, 32.0);
+        if body != cx.body {
+            cx.body = body;
+        }
+        if self.theme.appearance.font_path != self.font_path {
+            self.font_path = self.theme.appearance.font_path.clone();
+            if let Ok(t) = gui::text::Text::new(self.font_path.as_deref()) {
+                cx.text = t;
+            }
         }
         self.poll_downloads();
         if let Some(MicTest::Recording { started, .. }) = &self.mic {
             if started.elapsed() >= Duration::from_secs(8) {
-                self.finish_mic_test(ctx);
+                self.finish_mic_test();
             } else {
-                ctx.request_repaint_after(Duration::from_millis(33));
+                cx.request_repaint_after(Duration::from_millis(33));
             }
         }
         if let Some(MicTest::Transcribing(rx)) = &self.mic {
@@ -407,65 +491,184 @@ impl eframe::App for App {
                 self.mic = None;
             }
         }
-        if !self.downloads.is_empty() {
-            ctx.request_repaint_after(Duration::from_millis(200));
-        }
+    }
+
+    fn layout(&mut self, cx: &mut Ctx) {
+        self.before_frame(cx);
         let p = self.p();
+        let (w, h) = cx.size;
         // A tiling window manager may give the panel a narrow column: the
         // navigation then moves to a wrapped tab row at the top.
-        let narrow = ctx.screen_rect().width() < 780.0;
-        if narrow {
-            egui::TopBottomPanel::top("tabs")
-                .frame(
-                    egui::Frame::none()
-                        .fill(p.panel)
-                        .inner_margin(egui::Margin::symmetric(12.0, 10.0)),
-                )
-                .show(ctx, |ui| self.tab_row(ui));
+        let narrow = w < 780.0;
+        let central = if narrow {
+            let mut ui = Ui::new(cx, gui::canvas::Rect::new(12.0, 10.0, w - 24.0, h));
+            let slot = ui.cx.cmds.len();
+            ui.cx
+                .rect(gui::canvas::Rect::new(0.0, 0.0, w, 0.0), 0.0, p.panel);
+            self.tab_row(&mut ui);
+            let th = ui.used_height() + 20.0;
+            if let gui::ui::Cmd::Rect { r, .. } = &mut cx.cmds[slot] {
+                r.h = th;
+            }
+            gui::canvas::Rect::new(0.0, th, w, h - th)
         } else {
-            egui::SidePanel::left("nav")
-                .exact_width(212.0)
-                .resizable(false)
-                .frame(
-                    egui::Frame::none()
-                        .fill(p.panel)
-                        .inner_margin(egui::Margin::symmetric(14.0, 18.0)),
-                )
-                .show(ctx, |ui| self.nav(ui));
-        }
-        let margin = if narrow {
-            egui::Margin::symmetric(12.0, 12.0)
-        } else {
-            egui::Margin::symmetric(28.0, 22.0)
+            cx.rect(gui::canvas::Rect::new(0.0, 0.0, 212.0, h), 0.0, p.panel);
+            {
+                let mut ui = Ui::new(
+                    cx,
+                    gui::canvas::Rect::new(14.0, 18.0, 212.0 - 28.0, h - 36.0),
+                );
+                self.nav(&mut ui, h);
+            }
+            gui::canvas::Rect::new(212.0, 0.0, w - 212.0, h)
         };
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(p.background).inner_margin(margin))
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let width = ui.available_width().min(760.0);
-                        ui.set_width(width);
-                        match self.tab {
-                            Tab::Overview => self.overview(ui, ctx),
-                            Tab::Models => self.models_tab(ui, ctx),
-                            Tab::Shortcut => self.shortcut_tab(ui, ctx),
-                            Tab::Agent => self.agent_tab(ui, ctx),
-                            Tab::Commands => self.commands_tab(ui, ctx),
-                            Tab::Output => self.output_tab(ui),
-                            Tab::Vocabulary => self.vocabulary_tab(ui),
-                            Tab::History => self.history_tab(ui, ctx),
-                            Tab::Advanced => self.advanced_tab(ui),
-                        }
-                        ui.add_space(24.0);
-                    });
-            });
-        self.draw_toast(ctx);
+        let margin = if narrow { (12.0, 12.0) } else { (28.0, 22.0) };
+        if self.tab != self.last_tab {
+            self.scroll = 0.0;
+            self.last_tab = self.tab;
+        }
+        // Scrolling: the wheel over the content, PageUp/PageDown, the bar.
+        if let Some((x, y)) = cx.input.pos {
+            if central.contains(x, y) && cx.input.wheel != 0.0 {
+                self.scroll += cx.input.wheel;
+                cx.input.wheel = 0.0;
+            }
+        }
+        if !cx.has_focus() {
+            if cx.take_key(0xff55) {
+                self.scroll -= central.h * 0.85;
+            }
+            if cx.take_key(0xff56) {
+                self.scroll += central.h * 0.85;
+            }
+        }
+        let content_w = (central.w - 2.0 * margin.0 - 10.0).min(760.0);
+        let content_h = {
+            cx.rect(central, 0.0, p.background);
+            let mut ui = Ui::new(
+                cx,
+                gui::canvas::Rect::new(
+                    central.x + margin.0,
+                    central.y + margin.1 - self.scroll,
+                    content_w,
+                    0.0,
+                ),
+            );
+            ui.set_clip(Some(central));
+            match self.tab {
+                Tab::Overview => self.overview(&mut ui),
+                Tab::Models => self.models_tab(&mut ui),
+                Tab::Shortcut => self.shortcut_tab(&mut ui),
+                Tab::Agent => self.agent_tab(&mut ui),
+                Tab::Commands => self.commands_tab(&mut ui),
+                Tab::Output => self.output_tab(&mut ui),
+                Tab::Vocabulary => self.vocabulary_tab(&mut ui),
+                Tab::History => self.history_tab(&mut ui),
+                Tab::Advanced => self.advanced_tab(&mut ui),
+            }
+            ui.add_space(24.0);
+            let used = ui.used_height() + 24.0;
+            ui.set_clip(None);
+            used
+        };
+        let view = central.h - 2.0 * margin.1;
+        let max_scroll = (content_h - view).max(0.0);
+        let clamped = self.scroll.clamp(0.0, max_scroll);
+        if (clamped - self.scroll).abs() > 0.5 {
+            self.scroll = clamped;
+            cx.changed = true;
+        }
+        self.scroll = clamped;
+        if max_scroll > 0.0 {
+            self.scrollbar(cx, central, content_h + 2.0 * margin.1, max_scroll);
+        }
+        self.draw_toast(cx, central);
+        if let Some(t) = cx.tooltip.clone() {
+            draw_tooltip(cx, &t);
+        }
         self.persist();
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.polling.store(false, Ordering::Relaxed);
+    fn scrollbar(&mut self, cx: &mut Ctx, area: gui::canvas::Rect, total: f32, max_scroll: f32) {
+        let p = self.p();
+        let track = gui::canvas::Rect::new(area.right() - 10.0, area.y + 4.0, 6.0, area.h - 8.0);
+        let th = (track.h * area.h / total).max(30.0).min(track.h);
+        let ty = track.y + (track.h - th) * (self.scroll / max_scroll).clamp(0.0, 1.0);
+        let thumb = gui::canvas::Rect::new(track.x, ty, track.w, th);
+        let hot = cx.input.pos.is_some_and(|(x, y)| {
+            gui::canvas::Rect::new(track.x - 4.0, track.y, 14.0, track.h).contains(x, y)
+        });
+        if cx.input.pressed && hot {
+            let y = cx.input.pos.map_or(0.0, |p| p.1);
+            if !thumb.contains(thumb.x + 1.0, y) {
+                // Jump so the thumb centres on the pointer.
+                let t = ((y - track.y - th / 2.0) / (track.h - th)).clamp(0.0, 1.0);
+                self.scroll = t * max_scroll;
+            }
+            self.scroll_drag = Some((y, self.scroll));
+            cx.changed = true;
+        }
+        if cx.input.released {
+            self.scroll_drag = None;
+        }
+        if let (Some((y0, s0)), Some((_, y)), true) =
+            (self.scroll_drag, cx.input.pos, cx.input.down)
+        {
+            let per = max_scroll / (track.h - th).max(1.0);
+            self.scroll = (s0 + (y - y0) * per).clamp(0.0, max_scroll);
+        }
+        let c = if hot || self.scroll_drag.is_some() {
+            p.muted
+        } else {
+            gui::ui::mix(p.background, p.muted, 0.5)
+        };
+        cx.rect(thumb, 3.0, c);
+    }
+}
+
+fn draw_tooltip(cx: &mut Ctx, text: &str) {
+    let Some((x, y)) = cx.input.pos else { return };
+    let p = cx.p;
+    let size = 13.0;
+    let lh = cx.line_h(crate::fonts::Face::Sans, size);
+    let tw = cx.tw(crate::fonts::Face::Sans, size, text);
+    let (w, h) = (tw + 16.0, lh + 10.0);
+    let rx = (x + 12.0).min(cx.size.0 - w - 4.0).max(4.0);
+    let ry = if y + 22.0 + h < cx.size.1 {
+        y + 22.0
+    } else {
+        y - h - 8.0
+    };
+    let r = gui::canvas::Rect::new(rx, ry, w, h);
+    let start = cx.cmds.len();
+    cx.framed(r, 6.0, p.surface_hi, Some(p.border_hi));
+    cx.text_at(
+        rx + 8.0,
+        ry + 5.0,
+        size,
+        crate::fonts::Face::Sans,
+        p.foreground,
+        text,
+    );
+    let moved: Vec<_> = cx.cmds.drain(start..).collect();
+    cx.over.extend(moved);
+}
+
+impl gui::App for App {
+    fn frame(&mut self, cx: &mut Ctx) {
+        self.layout(cx);
+    }
+
+    fn outside(&mut self, event: Outside) {
+        match event {
+            Outside::ServiceState | Outside::FocusIn => self.refresh_status(),
+            Outside::Woken => {}
+        }
+    }
+
+    fn exit(&mut self) {
+        self.cfg.agent.opencode = self.agent_program.trim().to_string();
+        self.persist();
         for d in self.downloads.values() {
             d.cancel.store(true, Ordering::Relaxed);
         }
@@ -473,46 +676,55 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn nav(&mut self, ui: &mut egui::Ui) {
+    fn nav(&mut self, ui: &mut Ui, height: f32) {
         let p = self.p();
         ui.horizontal(|ui| {
-            widgets::logo(ui, &p, 28.0);
+            ui.logo(28.0);
             ui.vertical(|ui| {
                 ui.label(
-                    RichText::new("NIRUDICTATE")
+                    Rt::new("NIRUDICTATE")
                         .strong()
                         .size(16.0)
                         .color(p.foreground),
                 );
-                ui.label(RichText::new("Local dictation").size(12.0).color(p.muted));
+                ui.label(Rt::new("Local dictation").size(12.0).color(p.muted));
             });
         });
         ui.add_space(14.0);
         self.status_chip(ui);
         ui.add_space(18.0);
         for (tab, label) in TABS {
-            if widgets::nav_item(ui, &p, label, self.tab == *tab).clicked() {
+            if ui.nav_item(label, self.tab == *tab).clicked {
                 self.select(*tab);
             }
         }
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.label(
-                RichText::new(format!(
-                    "v{} · private, on this computer",
-                    env!("CARGO_PKG_VERSION")
-                ))
-                .size(11.0)
-                .color(p.muted),
+        // The version and the theme at the bottom.
+        let lh = ui.cx.line_h(crate::fonts::Face::Sans, 11.0);
+        let y = 18.0 + height - 36.0 - 2.0 * lh - 4.0;
+        if y > ui.cursor_y() {
+            let version = format!("v{} · private, on this computer", env!("CARGO_PKG_VERSION"));
+            let source = self.theme.source.clone();
+            ui.cx
+                .text_at(14.0, y, 11.0, crate::fonts::Face::Sans, p.disabled, &source);
+            ui.cx.text_at(
+                14.0,
+                y + lh + 4.0,
+                11.0,
+                crate::fonts::Face::Sans,
+                p.muted,
+                &version,
             );
-            ui.label(
-                RichText::new(self.theme.source.clone())
-                    .size(11.0)
-                    .color(p.disabled),
-            );
-        });
+        }
     }
 
     fn select(&mut self, tab: Tab) {
+        if self.tab == Tab::Agent && tab != Tab::Agent {
+            // Keep what was typed into the program field.
+            let program = self.agent_program.trim().to_string();
+            if program != self.cfg.agent.opencode {
+                self.cfg.agent.opencode = program;
+            }
+        }
         self.tab = tab;
         self.capturing_shortcut = false;
         self.capturing_agent = false;
@@ -524,41 +736,41 @@ impl App {
             self.history = history::load();
         }
         if tab == Tab::Advanced {
-            self.devices = audio::devices();
+            load_devices(self.devices.clone(), self.wake.clone());
             self.themes = theme::available_themes();
         }
     }
 
-    fn status_chip(&self, ui: &mut egui::Ui) {
+    fn status_chip(&self, ui: &mut Ui) {
         let p = self.p();
         let (label, color) = match self.status().as_ref().map(|s| s.state.as_str()) {
-            Some("recording") => ("Recording", widgets::red(&p)),
+            Some("recording") => ("Recording", red(&p)),
             Some("transcribing") => ("Transcribing", p.warning),
             Some(_) => ("Ready", p.success),
             None => ("Service stopped", p.error),
         };
-        chip(ui, &p, label, color);
+        ui.horizontal(|ui| ui.chip(label, color));
     }
 
     /// Navigation for a narrow window.
-    fn tab_row(&mut self, ui: &mut egui::Ui) {
+    fn tab_row(&mut self, ui: &mut Ui) {
         let p = self.p();
         ui.horizontal(|ui| {
-            widgets::logo(ui, &p, 22.0);
-            ui.label(RichText::new("NIRUDICTATE").strong().color(p.foreground));
+            ui.logo(22.0);
+            ui.label(Rt::new("NIRUDICTATE").strong().color(p.foreground));
             self.status_chip(ui);
         });
-        ui.add_space(6.0);
+        ui.add_space(-2.0);
         ui.horizontal_wrapped(|ui| {
             for (tab, label) in TABS {
-                if widgets::segment(ui, &p, label, self.tab == *tab).clicked() {
+                if ui.segment(label, self.tab == *tab).clicked {
                     self.select(*tab);
                 }
             }
         });
     }
 
-    fn draw_toast(&mut self, ctx: &egui::Context) {
+    fn draw_toast(&mut self, cx: &mut Ctx, area: gui::canvas::Rect) {
         let Some((text, at, error)) = self.toast.clone() else {
             return;
         };
@@ -567,42 +779,56 @@ impl App {
             self.toast = None;
             return;
         }
-        ctx.request_repaint_after(Duration::from_millis(250));
+        cx.request_repaint_after(Duration::from_secs(5) - age + Duration::from_millis(10));
         let p = self.p();
-        egui::Area::new(egui::Id::new("toast"))
-            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(100.0, -20.0))
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(p.surface_hi)
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        if error { p.error } else { p.border_hi },
-                    ))
-                    .rounding(10.0)
-                    .inner_margin(egui::Margin::symmetric(16.0, 10.0))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(text).color(if error {
-                            p.error
-                        } else {
-                            p.foreground
-                        }));
-                    });
-            });
+        let size = cx.body;
+        let lh = cx.line_h(crate::fonts::Face::Sans, size);
+        let max = (area.w - 40.0).max(100.0);
+        let tw = cx.tw(crate::fonts::Face::Sans, size, &text).min(max);
+        let shown = {
+            let s = cx.scale;
+            cx.text
+                .ellipsize(crate::fonts::Face::Sans, size * s, &text, max * s)
+        };
+        let (w, h) = (tw + 32.0, lh + 20.0);
+        let r = gui::canvas::Rect::new(
+            (area.x + (area.w - w) / 2.0).max(4.0),
+            cx.size.1 - 20.0 - h,
+            w,
+            h,
+        );
+        let start = cx.cmds.len();
+        cx.framed(
+            r,
+            10.0,
+            p.surface_hi,
+            Some(if error { p.error } else { p.border_hi }),
+        );
+        cx.text_at(
+            r.x + 16.0,
+            r.y + 10.0,
+            size,
+            crate::fonts::Face::Sans,
+            if error { p.error } else { p.foreground },
+            &shown,
+        );
+        let moved: Vec<_> = cx.cmds.drain(start..).collect();
+        cx.over.extend(moved);
     }
 
-    fn heading(&self, ui: &mut egui::Ui, title: &str, subtitle: &str) {
+    fn heading(&self, ui: &mut Ui, title: &str, subtitle: &str) {
         let p = self.p();
-        ui.label(RichText::new(title).size(24.0).strong().color(p.foreground));
-        ui.label(RichText::new(subtitle).color(p.muted));
+        ui.label(Rt::new(title).size(24.0).strong().color(p.foreground));
+        ui.label(Rt::new(subtitle).color(p.muted));
         ui.add_space(14.0);
         if let Some(e) = &self.save_error {
-            ui.label(RichText::new(format!("Not saved: {e}")).color(p.error));
+            ui.label(Rt::new(format!("Not saved: {e}")).color(p.error));
         }
     }
 
     // ── Overview ──────────────────────────────────────────────────────────
 
-    fn overview(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn overview(&mut self, ui: &mut Ui) {
         let p = self.p();
         self.heading(
             ui,
@@ -612,7 +838,7 @@ impl App {
         let status = self.status();
         let lang = self.cfg.general.language.clone();
         let active = models::active(&lang, self.cfg.model_for(&lang), &self.hw);
-        card(ui, &p, |ui| {
+        card(ui, |ui| {
             let (big, color, detail) = match status.as_ref() {
                 None => (
                     "Service not running",
@@ -621,7 +847,7 @@ impl App {
                 ),
                 Some(s) if s.state == "recording" => (
                     "Listening…",
-                    widgets::red(&p),
+                    red(&p),
                     format!("{:.0} s", s.recording_seconds),
                 ),
                 Some(s) if s.state == "transcribing" => (
@@ -646,30 +872,31 @@ impl App {
                 ),
             };
             ui.horizontal(|ui| {
-                widgets::status_dot(ui, color, 14.0);
-                ui.label(RichText::new(big).size(20.0).strong().color(p.foreground));
+                ui.status_dot(color, 14.0);
+                ui.label(Rt::new(big).size(20.0).strong().color(p.foreground));
             });
-            ui.label(RichText::new(detail).color(p.muted));
+            ui.label(Rt::new(detail).color(p.muted));
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 if status.is_none() {
-                    if widgets::primary_button(ui, &p, "Start service").clicked() {
+                    if ui.primary_button("Start service").clicked {
                         match start_service() {
                             Ok(()) => self.toast("Starting the service…", false),
                             Err(e) => self.toast(e, true),
                         }
                     }
                 } else if status.as_ref().is_some_and(|s| s.state == "recording") {
-                    if ui.button("Stop").clicked() {
+                    if ui.button("Stop").clicked {
                         let _ = ipc::send(&Request::Stop, Duration::from_secs(2));
                     }
                 } else if active.is_some()
                     && ui
                         .button("Dictate now")
                         .on_hover_text(
+                            ui,
                             "Starts recording; the text goes to the window that has focus",
                         )
-                        .clicked()
+                        .clicked
                 {
                     let _ = ipc::send(&Request::Start, Duration::from_secs(2));
                 }
@@ -680,17 +907,18 @@ impl App {
             {
                 {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Language").color(p.muted));
+                        ui.label(Rt::new("Language").color(p.muted));
                         for (code, label) in config::LANGUAGES {
-                            if widgets::segment(ui, &p, label, self.cfg.general.language == *code)
-                                .clicked()
+                            if ui
+                                .segment(label, self.cfg.general.language == *code)
+                                .clicked
                             {
                                 self.cfg.general.language = code.to_string();
                             }
                         }
                     });
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Model").color(p.muted));
+                        ui.label(Rt::new("Model").color(p.muted));
                         ui.label(match active {
                             Some(m) => format!(
                                 "{} · {}{}",
@@ -706,10 +934,10 @@ impl App {
                         });
                     });
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Shortcut").color(p.muted));
-                        widgets::keycaps(ui, &p, &self.cfg.shortcut.key);
+                        ui.label(Rt::new("Shortcut").color(p.muted));
+                        ui.keycaps(&self.cfg.shortcut.key);
                         ui.label(
-                            RichText::new(match self.cfg.shortcut.mode {
+                            Rt::new(match self.cfg.shortcut.mode {
                                 Mode::Hybrid => "tap to toggle · hold to talk",
                                 Mode::Toggle => "press to start and stop",
                                 Mode::Hold => "hold to talk",
@@ -723,8 +951,8 @@ impl App {
         if active.is_none() {
             let rec = models::recommend(&lang, &self.hw, self.measured);
             ui.add_space(12.0);
-            card(ui, &p, |ui| {
-                section_title(ui, &p, "Get started");
+            card(ui, |ui| {
+                section_title(ui, "Get started");
                 ui.label(format!(
                     "Download the recommended {} model for this computer: {} ({}).",
                     config::language_label(&lang),
@@ -732,14 +960,14 @@ impl App {
                     models::human_size(rec.bytes)
                 ));
                 ui.add_space(8.0);
-                self.download_row(ui, ctx, rec, true);
+                self.download_row(ui, rec, true);
             });
         }
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Microphone test");
+        card(ui, |ui| {
+            section_title(ui, "Microphone test");
             ui.label(
-                RichText::new("Say a sentence. It is transcribed here and not inserted anywhere.")
+                Rt::new("Say a sentence. It is transcribed here and not inserted anywhere.")
                     .color(p.muted),
             );
             ui.add_space(8.0);
@@ -750,12 +978,12 @@ impl App {
                         .lock()
                         .map(|s| s.levels.clone())
                         .unwrap_or_default();
-                    if widgets::primary_button(ui, &p, "Stop and transcribe").clicked() {
-                        self.finish_mic_test(ctx);
+                    if ui.primary_button("Stop and transcribe").clicked {
+                        self.finish_mic_test();
                     } else {
-                        level_meter(ui, &p, &levels, egui::vec2(260.0, 30.0));
+                        ui.level_meter(&levels, 260.0, 30.0);
                         ui.label(
-                            RichText::new(format!("{:.0} s", started.elapsed().as_secs_f32()))
+                            Rt::new(format!("{:.0} s", started.elapsed().as_secs_f32()))
                                 .color(p.muted),
                         );
                     }
@@ -763,11 +991,11 @@ impl App {
                 Some(MicTest::Transcribing(_)) => {
                     ui.spinner();
                     ui.label("Transcribing…");
-                    ctx.request_repaint_after(Duration::from_millis(100));
+                    ui.cx.request_repaint_after(Duration::from_millis(100));
                 }
                 None => {
-                    if widgets::primary_button(ui, &p, "Test microphone").clicked() {
-                        self.start_mic_test(ctx);
+                    if ui.primary_button("Test microphone").clicked {
+                        self.start_mic_test();
                     }
                 }
             });
@@ -782,9 +1010,9 @@ impl App {
                         },
                     )
                     .unwrap_or_else(|| "(no speech recognised)".into());
-                    widgets::quote(ui, &p, &shown);
+                    ui.quote(&shown);
                     ui.label(
-                        RichText::new(format!(
+                        Rt::new(format!(
                             "{} · {:.1} s of speech · {:.2} s to transcribe{}",
                             t.model,
                             t.audio_seconds,
@@ -801,26 +1029,26 @@ impl App {
                 }
                 Some(Err(e)) => {
                     ui.add_space(8.0);
-                    ui.label(RichText::new(e).color(p.error));
+                    ui.label(Rt::new(e).color(p.error));
                 }
                 None => {}
             }
         });
         if let Some(last) = status.as_ref().and_then(|s| s.last.clone()) {
             ui.add_space(12.0);
-            card(ui, &p, |ui| {
+            card(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    section_title(ui, &p, "Last dictation");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Copy").clicked() {
-                            ctx.output_mut(|o| o.copied_text = last.text.clone());
+                    section_title(ui, "Last dictation");
+                    ui.right_to_left(|ui| {
+                        if ui.small_button("Copy").clicked {
+                            ui.cx.copy = Some(last.text.clone());
                             self.toast("Copied", false);
                         }
                     });
                 });
-                widgets::quote(ui, &p, &last.text);
+                ui.quote(&last.text);
                 ui.label(
-                    RichText::new(format!(
+                    Rt::new(format!(
                         "{} · {:.1} s of speech · {:.2} s · {}",
                         last.model, last.audio_seconds, last.seconds, last.inserted_by
                     ))
@@ -833,14 +1061,7 @@ impl App {
 
     // ── Models ────────────────────────────────────────────────────────────
 
-    fn download_row(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        m: &'static Model,
-        big: bool,
-    ) {
-        let p = self.p();
+    fn download_row(&mut self, ui: &mut Ui, m: &'static Model, big: bool) {
         if let Some(d) = self.downloads.get(m.id) {
             let pr = d.progress.lock().map(|x| *x).unwrap_or_default();
             let frac = if pr.total > 0 {
@@ -859,41 +1080,40 @@ impl App {
                 )
             };
             ui.horizontal_wrapped(|ui| {
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .desired_width(if big { 320.0 } else { 200.0 })
-                        .text(text),
-                );
-                if ui.small_button("Cancel").clicked() {
+                ui.progress_bar(frac, if big { 320.0 } else { 200.0 }, &text);
+                if ui.small_button("Cancel").clicked {
                     d.cancel.store(true, Ordering::Relaxed);
                 }
             });
         } else if big {
-            if widgets::primary_button(ui, &p, &format!("Download {}", models::human_size(m.bytes)))
-                .clicked()
+            if ui
+                .primary_button(&format!("Download {}", models::human_size(m.bytes)))
+                .clicked
             {
-                self.start_download(m, ctx);
+                self.start_download(m);
             }
         } else if ui
             .button(format!("Download · {}", models::human_size(m.bytes)))
-            .clicked()
+            .clicked
         {
-            self.start_download(m, ctx);
+            self.start_download(m);
         }
     }
 
-    fn models_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn models_tab(&mut self, ui: &mut Ui) {
         let p = self.p();
         self.heading(
             ui,
             "Languages & Models",
             "Models are downloaded once, verified, and run on this computer only.",
         );
-        card(ui, &p, |ui| {
+        card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Dictation language").color(p.muted));
+                ui.label(Rt::new("Dictation language").color(p.muted));
                 for (code, label) in config::LANGUAGES {
-                    if widgets::segment(ui, &p, label, self.cfg.general.language == *code).clicked()
+                    if ui
+                        .segment(label, self.cfg.general.language == *code)
+                        .clicked
                     {
                         self.cfg.general.language = code.to_string();
                     }
@@ -901,7 +1121,7 @@ impl App {
             });
             ui.add_space(4.0);
             ui.label(
-                RichText::new(format!(
+                Rt::new(format!(
                     "{} · {} cores · {} · {} GB memory · speed {}",
                     self.hw.model,
                     self.hw.physical,
@@ -922,9 +1142,9 @@ impl App {
             let rec = models::recommend(code, &self.hw, self.measured);
             let active = models::active(code, self.cfg.model_for(code), &self.hw);
             ui.horizontal_wrapped(|ui| {
-                section_title(ui, &p, label);
+                section_title(ui, label);
                 ui.label(
-                    RichText::new(match *code {
+                    Rt::new(match *code {
                         "sv" => "KB-Whisper by KBLab (National Library of Sweden) · Apache-2.0",
                         _ => "OpenAI Whisper via whisper.cpp · MIT",
                     })
@@ -932,23 +1152,23 @@ impl App {
                     .color(p.muted),
                 );
             });
-            card(ui, &p, |ui| {
+            card(ui, |ui| {
                 for m in models::for_language(code) {
                     let installed = m.installed();
                     let is_active = active.map(|a| a.id) == Some(m.id);
                     {
                         {
                             ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new(m.label).strong().color(p.foreground));
+                                ui.label(Rt::new(m.label).strong().color(p.foreground));
                                 if m.id == rec.id {
-                                    chip(ui, &p, "Recommended", p.accent);
+                                    ui.chip("Recommended", p.accent);
                                 }
                                 if is_active {
-                                    chip(ui, &p, "In use", p.success);
+                                    ui.chip("In use", p.success);
                                 }
                             });
                             ui.label(
-                                RichText::new(format!(
+                                Rt::new(format!(
                                     "{} · about {:.1} s per dictation here · {} MB memory",
                                     models::human_size(m.bytes),
                                     models::estimate(m, &self.hw, self.measured),
@@ -961,7 +1181,7 @@ impl App {
                         ui.horizontal_wrapped(|ui| {
                             if installed {
                                 if self.confirm_delete == Some(m.id) {
-                                    if ui.button(RichText::new("Delete").color(p.error)).clicked() {
+                                    if ui.button(Rt::new("Delete").color(p.error)).clicked {
                                         match models::delete(m) {
                                             Ok(()) => {
                                                 let _ = ipc::send(
@@ -977,19 +1197,19 @@ impl App {
                                         }
                                         self.confirm_delete = None;
                                     }
-                                    if ui.button("Keep").clicked() {
+                                    if ui.button("Keep").clicked {
                                         self.confirm_delete = None;
                                     }
                                 } else {
-                                    if !is_active && ui.button("Use").clicked() {
+                                    if !is_active && ui.button("Use").clicked {
                                         self.cfg.set_model_for(code, m.id);
                                     }
-                                    if ui.small_button("Delete…").clicked() {
+                                    if ui.small_button("Delete…").clicked {
                                         self.confirm_delete = Some(m.id);
                                     }
                                 }
                             } else {
-                                self.download_row(ui, ctx, m, false);
+                                self.download_row(ui, m, false);
                             }
                         });
                     }
@@ -998,14 +1218,11 @@ impl App {
                     ui.add_space(4.0);
                 }
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Automatic choice:").size(12.0).color(p.muted));
+                    ui.label(Rt::new("Automatic choice:").size(12.0).color(p.muted));
                     let auto = self.cfg.model_for(code).is_empty();
                     if ui
-                        .radio(
-                            auto,
-                            RichText::new("largest fast enough installed model").size(12.0),
-                        )
-                        .clicked()
+                        .radio(auto, "largest fast enough installed model")
+                        .clicked
                     {
                         self.cfg.set_model_for(code, "");
                     }
@@ -1014,7 +1231,7 @@ impl App {
         }
         ui.add_space(12.0);
         ui.label(
-            RichText::new(format!("Stored in {}", config::models_dir().display()))
+            Rt::new(format!("Stored in {}", config::models_dir().display()))
                 .size(12.0)
                 .color(p.muted),
         );
@@ -1022,21 +1239,19 @@ impl App {
 
     // ── Shortcut ──────────────────────────────────────────────────────────
 
-    fn shortcut_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn shortcut_tab(&mut self, ui: &mut Ui) {
         let p = self.p();
         self.heading(
             ui,
             "Shortcut & Mode",
             "One key combination starts and stops dictation in any application.",
         );
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Shortcut");
+        card(ui, |ui| {
+            section_title(ui, "Shortcut");
             ui.horizontal_wrapped(|ui| {
                 if self.capturing_shortcut {
-                    ui.label(
-                        RichText::new("Press the new combination… (Esc cancels)").color(p.accent),
-                    );
-                    if let Some(spec) = widgets::capture_shortcut(ctx) {
+                    ui.label(Rt::new("Press the new combination… (Esc cancels)").color(p.accent));
+                    if let Some(spec) = widgets::capture_shortcut(&ui.cx.input.keys) {
                         if spec == "escape" {
                             self.capturing_shortcut = false;
                         } else if hotkey::parse(&spec).is_ok() {
@@ -1050,11 +1265,11 @@ impl App {
                         }
                     }
                 } else {
-                    widgets::keycaps(ui, &p, &self.cfg.shortcut.key);
-                    if ui.button("Change…").clicked() {
+                    ui.keycaps(&self.cfg.shortcut.key);
+                    if ui.button("Change…").clicked {
                         self.capturing_shortcut = true;
                     }
-                    if self.cfg.shortcut.key != "ctrl+alt+space" && ui.button("Default").clicked() {
+                    if self.cfg.shortcut.key != "ctrl+alt+space" && ui.button("Default").clicked {
                         self.cfg.shortcut.key = "ctrl+alt+space".into();
                     }
                 }
@@ -1062,7 +1277,7 @@ impl App {
             if let Some(s) = self.status() {
                 if !s.shortcut_active {
                     ui.label(
-                        RichText::new(
+                        Rt::new(
                             s.error
                                 .unwrap_or_else(|| "The shortcut is not active".into()),
                         )
@@ -1071,60 +1286,80 @@ impl App {
                 }
             }
             ui.label(
-                RichText::new("NIRUDICTATE listens for this combination itself; the window manager is not changed. Ctrl+Alt+Space is free in NIRUWM.")
+                Rt::new("NIRUDICTATE listens for this combination itself; the window manager is not changed. Ctrl+Alt+Space is free in NIRUWM.")
                     .size(12.0)
                     .color(p.muted),
             );
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Mode");
+        card(ui, |ui| {
+            section_title(ui, "Mode");
             for mode in [Mode::Hybrid, Mode::Toggle, Mode::Hold] {
                 ui.radio_value(&mut self.cfg.shortcut.mode, mode, mode.label());
             }
             ui.add_space(8.0);
-            egui::Grid::new("mode-grid")
-                .num_columns(2)
-                .spacing([18.0, 10.0])
-                .show(ui, |ui| {
-                    if self.cfg.shortcut.mode == Mode::Hybrid {
-                        ui.label("Hold longer than");
-                        ui.add(
-                            egui::Slider::new(&mut self.cfg.shortcut.hold_ms, 150..=1000)
-                                .suffix(" ms")
-                                .text("for push-to-talk"),
-                        );
-                        ui.end_row();
+            let col = col(
+                ui,
+                &[
+                    "Hold longer than",
+                    "Stop after silence",
+                    "Longest dictation",
+                ],
+            );
+            if self.cfg.shortcut.mode == Mode::Hybrid {
+                grid_row(ui, col, "Hold longer than", |ui| {
+                    if let Some(v) = ui.slider(
+                        "hold",
+                        self.cfg.shortcut.hold_ms as f64,
+                        150.0,
+                        1000.0,
+                        1.0,
+                        0,
+                        " ms",
+                        "for push-to-talk",
+                    ) {
+                        self.cfg.shortcut.hold_ms = v as u64;
                     }
-                    if self.cfg.shortcut.mode != Mode::Hold {
-                        ui.label("Stop after silence");
-                        ui.horizontal_wrapped(|ui| {
-                            let mut on = self.cfg.shortcut.silence_seconds > 0.0;
-                            if ui.checkbox(&mut on, "").changed() {
-                                self.cfg.shortcut.silence_seconds = if on { 2.0 } else { 0.0 };
-                            }
-                            if on {
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.cfg.shortcut.silence_seconds,
-                                        0.5..=10.0,
-                                    )
-                                    .step_by(0.5)
-                                    .suffix(" s"),
-                                );
-                            } else {
-                                ui.label(RichText::new("off — press again to stop").color(p.muted));
-                            }
-                        });
-                        ui.end_row();
-                    }
-                    ui.label("Longest dictation");
-                    ui.add(
-                        egui::Slider::new(&mut self.cfg.shortcut.max_seconds, 10..=600)
-                            .suffix(" s"),
-                    );
-                    ui.end_row();
                 });
+            }
+            if self.cfg.shortcut.mode != Mode::Hold {
+                grid_row(ui, col, "Stop after silence", |ui| {
+                    let mut on = self.cfg.shortcut.silence_seconds > 0.0;
+                    if ui.checkbox(&mut on, "").changed {
+                        self.cfg.shortcut.silence_seconds = if on { 2.0 } else { 0.0 };
+                    }
+                    if on {
+                        if let Some(v) = ui.slider(
+                            "silence",
+                            self.cfg.shortcut.silence_seconds as f64,
+                            0.5,
+                            10.0,
+                            0.5,
+                            1,
+                            " s",
+                            "",
+                        ) {
+                            self.cfg.shortcut.silence_seconds = v as f32;
+                        }
+                    } else {
+                        ui.label(Rt::new("off — press again to stop").color(p.muted));
+                    }
+                });
+            }
+            grid_row(ui, col, "Longest dictation", |ui| {
+                if let Some(v) = ui.slider(
+                    "longest",
+                    self.cfg.shortcut.max_seconds as f64,
+                    10.0,
+                    600.0,
+                    1.0,
+                    0,
+                    " s",
+                    "",
+                ) {
+                    self.cfg.shortcut.max_seconds = v as u32;
+                }
+            });
         });
     }
 
@@ -1147,7 +1382,7 @@ impl App {
             });
     }
 
-    fn agent_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn agent_tab(&mut self, ui: &mut Ui) {
         let p = self.p();
         self.heading(
             ui,
@@ -1156,39 +1391,37 @@ impl App {
         );
         let status = self.status().and_then(|s| s.agent);
         let found = self.opencode.lock().ok().and_then(|o| o.clone());
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "opencode");
+        card(ui, |ui| {
+            section_title(ui, "opencode");
             match &found {
                 Some(Ok(o)) => {
                     ui.label(
-                        RichText::new(format!("opencode {} — {}", o.version, o.path.display()))
+                        Rt::new(format!("opencode {} — {}", o.version, o.path.display()))
                             .color(p.success),
                     );
                 }
                 Some(Err(e)) => {
-                    ui.label(RichText::new(e.clone()).color(p.warning));
+                    ui.label(Rt::new(e.clone()).color(p.warning));
                     ui.label(
-                        RichText::new("Agent mode needs opencode (https://opencode.ai). Without it the agent shortcut is not taken.")
+                        Rt::new("Agent mode needs opencode (https://opencode.ai). Without it the agent shortcut is not taken.")
                             .size(12.0)
                             .color(p.muted),
                     );
                 }
                 None => {
-                    ui.label(RichText::new("Looking for opencode…").color(p.muted));
-                    ctx.request_repaint_after(Duration::from_millis(200));
+                    ui.label(Rt::new("Looking for opencode…").color(p.muted));
+                    ui.cx.request_repaint_after(Duration::from_millis(200));
                 }
             }
             ui.checkbox(&mut self.cfg.agent.enabled, "Use agent mode");
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Shortcut");
+        card(ui, |ui| {
+            section_title(ui, "Shortcut");
             ui.horizontal_wrapped(|ui| {
                 if self.capturing_agent {
-                    ui.label(
-                        RichText::new("Press the new combination… (Esc cancels)").color(p.accent),
-                    );
-                    if let Some(spec) = widgets::capture_shortcut(ctx) {
+                    ui.label(Rt::new("Press the new combination… (Esc cancels)").color(p.accent));
+                    if let Some(spec) = widgets::capture_shortcut(&ui.cx.input.keys) {
                         if spec == "escape" {
                             self.capturing_agent = false;
                         } else if hotkey::parse(&spec).is_ok()
@@ -1205,11 +1438,11 @@ impl App {
                         }
                     }
                 } else {
-                    widgets::keycaps(ui, &p, &self.cfg.agent.key);
-                    if ui.button("Change…").clicked() {
+                    ui.keycaps(&self.cfg.agent.key);
+                    if ui.button("Change…").clicked {
                         self.capturing_agent = true;
                     }
-                    if self.cfg.agent.key != "shift+alt+space" && ui.button("Default").clicked() {
+                    if self.cfg.agent.key != "shift+alt+space" && ui.button("Default").clicked {
                         self.cfg.agent.key = "shift+alt+space".into();
                     }
                 }
@@ -1217,7 +1450,7 @@ impl App {
             if let Some(a) = &status {
                 if self.cfg.agent.enabled && (a.problem.is_some() || !a.shortcut_active) {
                     ui.label(
-                        RichText::new(
+                        Rt::new(
                             a.problem
                                 .clone()
                                 .unwrap_or_else(|| "The agent shortcut is not active".into()),
@@ -1227,7 +1460,7 @@ impl App {
                 }
             }
             ui.label(
-                RichText::new(format!(
+                Rt::new(format!(
                     "Works like the dictation shortcut ({}): tap to start, it stops after a pause or a second tap; or hold while you speak. Tap twice quickly to start a new conversation.",
                     self.cfg.shortcut.mode.label()
                 ))
@@ -1240,73 +1473,70 @@ impl App {
             );
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Before sending");
-            egui::Grid::new("agent-confirm")
-                .num_columns(2)
-                .spacing([18.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label("Send by itself after");
-                    ui.add(
-                        egui::Slider::new(&mut self.cfg.agent.confirm_seconds, 0.0..=10.0)
-                            .step_by(0.5)
-                            .suffix(" s"),
-                    );
-                    ui.end_row();
-                });
+        card(ui, |ui| {
+            section_title(ui, "Before sending");
+            let c = col(ui, &["Send by itself after"]);
+            grid_row(ui, c, "Send by itself after", |ui| {
+                if let Some(v) = ui.slider(
+                    "confirm",
+                    self.cfg.agent.confirm_seconds as f64,
+                    0.0,
+                    10.0,
+                    0.5,
+                    1,
+                    " s",
+                    "",
+                ) {
+                    self.cfg.agent.confirm_seconds = v as f32;
+                }
+            });
             ui.label(
-                RichText::new("A small box shows what will be sent. Enter sends at once, Esc cancels. 0 s sends without the box.")
+                Rt::new("A small box shows what will be sent. Enter sends at once, Esc cancels. 0 s sends without the box.")
                     .size(12.0)
                     .color(p.muted),
             );
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Conversation");
-            egui::Grid::new("agent-conv")
-                .num_columns(2)
-                .spacing([18.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label("Working folder");
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.agent_dir)
-                                .hint_text("~")
-                                .desired_width(280.0),
-                        )
-                        .changed()
-                    {
-                        let d = self.agent_dir.trim();
-                        if d.is_empty() || d.starts_with('~') || d.starts_with('/') {
-                            self.cfg.agent.directory =
-                                if d.is_empty() { "~".into() } else { d.into() };
-                        }
+        card(ui, |ui| {
+            section_title(ui, "Conversation");
+            let c = col(ui, &["Working folder", "opencode agent"]);
+            grid_row(ui, c, "Working folder", |ui| {
+                if ui
+                    .text_edit("agent-dir", &mut self.agent_dir, "~", Some(280.0), 0, false)
+                    .changed
+                {
+                    let d = self.agent_dir.trim();
+                    if d.is_empty() || d.starts_with('~') || d.starts_with('/') {
+                        self.cfg.agent.directory = if d.is_empty() { "~".into() } else { d.into() };
                     }
-                    ui.end_row();
-                    ui.label("opencode agent");
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.agent_name)
-                                .hint_text("default agent")
-                                .desired_width(280.0),
-                        )
-                        .changed()
-                    {
-                        let n = self.agent_name.trim();
-                        if !n.chars().any(char::is_whitespace) {
-                            self.cfg.agent.agent = n.into();
-                        }
+                }
+            });
+            grid_row(ui, c, "opencode agent", |ui| {
+                if ui
+                    .text_edit(
+                        "agent-name",
+                        &mut self.agent_name,
+                        "default agent",
+                        Some(280.0),
+                        0,
+                        false,
+                    )
+                    .changed
+                {
+                    let n = self.agent_name.trim();
+                    if !n.chars().any(char::is_whitespace) {
+                        self.cfg.agent.agent = n.into();
                     }
-                    ui.end_row();
-                });
+                }
+            });
             ui.label(
-                RichText::new("opencode works in this folder (~ is your home folder). Leave the agent empty for opencode's default agent. Nothing is approved automatically: opencode asks in its window as usual.")
+                Rt::new("opencode works in this folder (~ is your home folder). Leave the agent empty for opencode's default agent. Nothing is approved automatically: opencode asks in its window as usual.")
                     .size(12.0)
                     .color(p.muted),
             );
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
-                if widgets::primary_button(ui, &p, "Start a new conversation").clicked() {
+                if ui.primary_button("Start a new conversation").clicked {
                     match ipc::send(&Request::AgentNew, Duration::from_secs(2)) {
                         Ok(r) if r.ok => {
                             self.toast("The next message starts a new conversation", false)
@@ -1315,7 +1545,7 @@ impl App {
                         Err(e) => self.toast(e, true),
                     }
                 }
-                if ui.button("Show opencode (Super+Alt+9)").clicked() {
+                if ui.button("Show opencode (Super+Alt+9)").clicked {
                     if let Err(e) = ipc::send(&Request::AgentShow, Duration::from_secs(2)) {
                         self.toast(e, true);
                     }
@@ -1327,45 +1557,42 @@ impl App {
                     (Some(id), false) => format!("Continuing conversation {id}."),
                     (None, false) => "The first message starts a conversation.".to_string(),
                 };
-                ui.label(RichText::new(line).size(12.0).color(p.muted));
+                ui.label(Rt::new(line).size(12.0).color(p.muted));
             }
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Window");
-            egui::Grid::new("agent-window")
-                .num_columns(2)
-                .spacing([18.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label("Terminal");
-                    egui::ComboBox::from_id_salt("agent-terminal")
-                        .selected_text(self.cfg.agent.terminal.clone())
-                        .show_ui(ui, |ui| {
-                            for t in config::TERMINALS {
-                                ui.selectable_value(
-                                    &mut self.cfg.agent.terminal,
-                                    t.to_string(),
-                                    *t,
-                                );
-                            }
-                        });
-                    ui.end_row();
-                    ui.label("opencode program");
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.agent_program)
-                                .hint_text("found automatically")
-                                .desired_width(280.0),
-                        )
-                        .lost_focus()
-                    {
-                        self.cfg.agent.opencode = self.agent_program.trim().to_string();
-                        self.probe_opencode();
-                    }
-                    ui.end_row();
-                });
+        card(ui, |ui| {
+            section_title(ui, "Window");
+            let c = col(ui, &["Terminal", "opencode program"]);
+            grid_row(ui, c, "Terminal", |ui| {
+                let items: Vec<String> = config::TERMINALS.iter().map(|t| t.to_string()).collect();
+                if let Some(i) = ui.combo("agent-terminal", &self.cfg.agent.terminal, None, &items)
+                {
+                    self.cfg.agent.terminal = items[i].clone();
+                }
+            });
+            let mut probe = false;
+            grid_row(ui, c, "opencode program", |ui| {
+                if ui
+                    .text_edit(
+                        "agent-program",
+                        &mut self.agent_program,
+                        "found automatically",
+                        Some(280.0),
+                        0,
+                        false,
+                    )
+                    .lost_focus
+                {
+                    self.cfg.agent.opencode = self.agent_program.trim().to_string();
+                    probe = true;
+                }
+            });
+            if probe {
+                self.probe_opencode();
+            }
             ui.label(
-                RichText::new("opencode runs in NIRUWM scratchpad 9 (Super+Alt+9) and comes to the front when a message is sent. Closing that window ends its opencode server; the next message opens it again and continues the conversation.")
+                Rt::new("opencode runs in NIRUWM scratchpad 9 (Super+Alt+9) and comes to the front when a message is sent. Closing that window ends its opencode server; the next message opens it again and continues the conversation.")
                     .size(12.0)
                     .color(p.muted),
             );
@@ -1374,7 +1601,7 @@ impl App {
 
     // ── Voice commands ────────────────────────────────────────────────────
 
-    fn commands_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn commands_tab(&mut self, ui: &mut Ui) {
         let p = self.p();
         self.heading(
             ui,
@@ -1382,15 +1609,15 @@ impl App {
             "Say what to do in Swedish or English: \"öppna terminalen\", \"go to workspace 3\", \"lås skärmen\".",
         );
         let status = self.status().and_then(|s| s.command);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Shortcut");
+        card(ui, |ui| {
+            section_title(ui, "Shortcut");
             ui.checkbox(&mut self.cfg.command.enabled, "Use voice commands");
             ui.horizontal_wrapped(|ui| {
                 if self.capturing_command {
                     ui.label(
-                        RichText::new("Press the new combination… (Esc cancels)").color(p.accent),
+                        Rt::new("Press the new combination… (Esc cancels)").color(p.accent),
                     );
-                    if let Some(spec) = widgets::capture_shortcut(ctx) {
+                    if let Some(spec) = widgets::capture_shortcut(&ui.cx.input.keys) {
                         let taken = [&self.cfg.shortcut.key, &self.cfg.agent.key]
                             .iter()
                             .any(|k| hotkey::parse(k).ok() == hotkey::parse(&spec).ok());
@@ -1407,11 +1634,11 @@ impl App {
                         }
                     }
                 } else {
-                    widgets::keycaps(ui, &p, &self.cfg.command.key);
-                    if ui.button("Change…").clicked() {
+                    ui.keycaps(&self.cfg.command.key);
+                    if ui.button("Change…").clicked {
                         self.capturing_command = true;
                     }
-                    if self.cfg.command.key != "super+alt+space" && ui.button("Default").clicked()
+                    if self.cfg.command.key != "super+alt+space" && ui.button("Default").clicked
                     {
                         self.cfg.command.key = "super+alt+space".into();
                     }
@@ -1420,7 +1647,7 @@ impl App {
             if let Some(c) = &status {
                 if self.cfg.command.enabled && (c.problem.is_some() || !c.shortcut_active) {
                     ui.label(
-                        RichText::new(
+                        Rt::new(
                             c.problem
                                 .clone()
                                 .unwrap_or_else(|| "The command shortcut is not active".into()),
@@ -1430,7 +1657,7 @@ impl App {
                 }
             }
             ui.label(
-                RichText::new(format!(
+                Rt::new(format!(
                     "Works like the dictation shortcut ({}): tap, say the command, and it runs after a short pause; or hold while you speak. Nothing else is ever run: only the commands listed below.",
                     self.cfg.shortcut.mode.label()
                 ))
@@ -1439,8 +1666,8 @@ impl App {
             );
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Listening");
+        card(ui, |ui| {
+            section_title(ui, "Listening");
             let label = |l: &str| match l {
                 "both" => "Dictation language, then the other",
                 "auto" => "Detect the language (slower)",
@@ -1448,26 +1675,23 @@ impl App {
                 "en" => "English",
                 _ => "Only the dictation language",
             };
-            egui::Grid::new("command-lang")
-                .num_columns(2)
-                .spacing([18.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label("Language");
-                    egui::ComboBox::from_id_salt("command-language")
-                        .selected_text(label(&self.cfg.command.language))
-                        .show_ui(ui, |ui| {
-                            for l in config::COMMAND_LANGUAGES {
-                                ui.selectable_value(
-                                    &mut self.cfg.command.language,
-                                    l.to_string(),
-                                    label(l),
-                                );
-                            }
-                        });
-                    ui.end_row();
-                });
+            let c = col(ui, &["Language"]);
+            grid_row(ui, c, "Language", |ui| {
+                let items: Vec<String> = config::COMMAND_LANGUAGES
+                    .iter()
+                    .map(|l| label(l).to_string())
+                    .collect();
+                if let Some(i) = ui.combo(
+                    "command-language",
+                    label(&self.cfg.command.language),
+                    None,
+                    &items,
+                ) {
+                    self.cfg.command.language = config::COMMAND_LANGUAGES[i].to_string();
+                }
+            });
             ui.label(
-                RichText::new("With both models installed, a command that the dictation model did not understand is tried once more with the other language's model (Languages & Models). With the Swedish model alone, many English commands still work: they come out in Swedish and match.")
+                Rt::new("With both models installed, a command that the dictation model did not understand is tried once more with the other language's model (Languages & Models). With the Swedish model alone, many English commands still work: they come out in Swedish and match.")
                     .size(12.0)
                     .color(p.muted),
             );
@@ -1481,17 +1705,17 @@ impl App {
             );
             if !self.cfg.command.confirm_dangerous {
                 ui.label(
-                    RichText::new("These run at once when they are understood.")
+                    Rt::new("These run at once when they are understood.")
                         .size(12.0)
                         .color(p.warning),
                 );
             }
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "What you can say");
+        card(ui, |ui| {
+            section_title(ui, "What you can say");
             ui.label(
-                RichText::new("Politeness and fillers are fine (\"kan du\", \"snälla\", \"please\"). Numbers work as words or digits. When a command is not understood nothing runs.")
+                Rt::new("Politeness and fillers are fine (\"kan du\", \"snälla\", \"please\"). Numbers work as words or digits. When a command is not understood nothing runs.")
                     .size(12.0)
                     .color(p.muted),
             );
@@ -1500,11 +1724,11 @@ impl App {
             for (lang, label, examples) in crate::command::phrase_list() {
                 if label != last {
                     ui.add_space(4.0);
-                    ui.label(RichText::new(label).strong().color(p.foreground));
+                    ui.label(Rt::new(label).strong().color(p.foreground));
                     last = label;
                 }
                 ui.label(
-                    RichText::new(format!("{}  {}", lang.code(), examples.join(" · ")))
+                    Rt::new(format!("{}  {}", lang.code(), examples.join(" · ")))
                         .size(12.0)
                         .color(p.muted),
                 );
@@ -1514,15 +1738,15 @@ impl App {
 
     // ── Output ────────────────────────────────────────────────────────────
 
-    fn output_tab(&mut self, ui: &mut egui::Ui) {
+    fn output_tab(&mut self, ui: &mut Ui) {
         let p = self.p();
         self.heading(
             ui,
             "Output",
             "How the text reaches the window you are typing in.",
         );
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Insert by");
+        card(ui, |ui| {
+            section_title(ui, "Insert by");
             ui.radio_value(
                 &mut self.cfg.output.method,
                 Method::Paste,
@@ -1546,8 +1770,8 @@ impl App {
             }
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Text");
+        card(ui, |ui| {
+            section_title(ui, "Text");
             ui.checkbox(
                 &mut self.cfg.output.capitalize,
                 "Start with a capital letter",
@@ -1558,10 +1782,10 @@ impl App {
             );
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Terminals");
+        card(ui, |ui| {
+            section_title(ui, "Terminals");
             ui.label(
-                RichText::new(format!(
+                Rt::new(format!(
                     "Recognised automatically: {} and more. xterm and urxvt use Shift+Insert.",
                     crate::insert::TERMINALS[..6].join(", ")
                 ))
@@ -1571,12 +1795,15 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Also treat as terminals (WM_CLASS):");
                 if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.terminals)
-                            .hint_text("e.g. myterm, cool-retro-term")
-                            .desired_width(260.0),
+                    .text_edit(
+                        "terminals",
+                        &mut self.terminals,
+                        "e.g. myterm, cool-retro-term",
+                        Some(260.0),
+                        0,
+                        false,
                     )
-                    .changed()
+                    .changed
                 {
                     self.cfg.output.terminals = self
                         .terminals
@@ -1588,15 +1815,15 @@ impl App {
             });
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Feedback");
+        card(ui, |ui| {
+            section_title(ui, "Feedback");
             ui.checkbox(
                 &mut self.cfg.general.overlay,
                 "Show the recording overlay at the bottom of the screen",
             );
             ui.checkbox(&mut self.cfg.general.sounds, "Play the dictation sounds");
             ui.label(
-                RichText::new(if crate::sounds::available() {
+                Rt::new(if crate::sounds::available() {
                     "Sounds come from NIRUX: `nirux sounds toggle dictation` or each event, own files in ~/.config/nirux/sounds/."
                 } else {
                     "Sounds need NIRUX (`nirux sounds`); without it dictation is silent."
@@ -1609,23 +1836,18 @@ impl App {
 
     // ── Vocabulary ────────────────────────────────────────────────────────
 
-    fn vocabulary_tab(&mut self, ui: &mut egui::Ui) {
+    fn vocabulary_tab(&mut self, ui: &mut Ui) {
         let p = self.p();
         self.heading(
             ui,
             "Vocabulary",
             "Names and words the model should spell your way: products, people, places, jargon.",
         );
-        card(ui, &p, |ui| {
-            ui.label(RichText::new("One word or phrase per line").color(p.muted));
+        card(ui, |ui| {
+            ui.label(Rt::new("One word or phrase per line").color(p.muted));
             let changed = ui
-                .add(
-                    egui::TextEdit::multiline(&mut self.vocab)
-                        .desired_rows(12)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
-                )
-                .changed();
+                .text_edit("vocabulary", &mut self.vocab, "", None, 12, true)
+                .changed;
             if changed {
                 self.cfg.vocabulary.words = self
                     .vocab
@@ -1637,55 +1859,48 @@ impl App {
             ui.add_space(6.0);
             let prompt = text::prompt(&self.cfg.vocabulary.words, &self.cfg.general.language);
             ui.label(
-                RichText::new("Given to the model as a hint:")
+                Rt::new("Given to the model as a hint:")
                     .size(12.0)
                     .color(p.muted),
             );
-            widgets::quote(
-                ui,
-                &p,
-                if prompt.is_empty() {
-                    "(nothing)"
-                } else {
-                    &prompt
-                },
-            );
+            ui.quote(if prompt.is_empty() {
+                "(nothing)"
+            } else {
+                &prompt
+            });
             ui.label(
-                RichText::new(
-                    "A short list works best; the model only sees about 200 words of hint.",
-                )
-                .size(12.0)
-                .color(p.muted),
+                Rt::new("A short list works best; the model only sees about 200 words of hint.")
+                    .size(12.0)
+                    .color(p.muted),
             );
         });
     }
 
     // ── History ───────────────────────────────────────────────────────────
 
-    fn history_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn history_tab(&mut self, ui: &mut Ui) {
         let p = self.p();
         self.heading(
             ui,
             "History",
             "Kept only on this computer, readable only by you. Audio is never stored.",
         );
-        card(ui, &p, |ui| {
+        card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.checkbox(&mut self.cfg.history.enabled, "Keep a history");
                 if self.cfg.history.enabled {
                     ui.label("· keep the last");
-                    ui.add(
-                        egui::DragValue::new(&mut self.cfg.history.keep)
-                            .range(10..=5000)
-                            .speed(5),
-                    );
+                    let mut keep = self.cfg.history.keep.min(u32::MAX as usize) as u32;
+                    if ui.drag_value("keep", &mut keep, 10, 5000, 5.0, "").changed {
+                        self.cfg.history.keep = keep as usize;
+                    }
                     ui.label("dictations");
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.right_to_left(|ui| {
                     if self.confirm_clear {
                         if ui
-                            .button(RichText::new("Delete everything").color(p.error))
-                            .clicked()
+                            .button(Rt::new("Delete everything").color(p.error))
+                            .clicked
                         {
                             match history::clear() {
                                 Ok(()) => {
@@ -1696,52 +1911,48 @@ impl App {
                             }
                             self.confirm_clear = false;
                         }
-                        if ui.button("Keep").clicked() {
+                        if ui.button("Keep").clicked {
                             self.confirm_clear = false;
                         }
-                    } else if !self.history.is_empty() && ui.button("Clear all…").clicked() {
+                    } else if !self.history.is_empty() && ui.button("Clear all…").clicked {
                         self.confirm_clear = true;
                     }
                 });
             });
             ui.label(
-                RichText::new(format!("{} (mode 0600)", config::history_path().display()))
+                Rt::new(format!("{} (mode 0600)", config::history_path().display()))
                     .size(12.0)
                     .color(p.muted),
             );
         });
         ui.add_space(12.0);
         if self.history.is_empty() {
-            ui.label(RichText::new("Nothing yet.").color(p.muted));
+            ui.label(Rt::new("Nothing yet.").color(p.muted));
             return;
         }
         let mut delete = None;
         for e in self.history.iter().rev().take(300) {
-            card(ui, &p, |ui| {
+            card(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    ui.label(Rt::new(widgets::when(e.time)).size(12.0).color(p.muted));
                     ui.label(
-                        RichText::new(widgets::when(e.time))
-                            .size(12.0)
-                            .color(p.muted),
-                    );
-                    ui.label(
-                        RichText::new(format!(
+                        Rt::new(format!(
                             "{} · {:.1} s · {}",
                             e.model, e.audio_seconds, e.language
                         ))
                         .size(12.0)
                         .color(p.disabled),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Delete").clicked() {
+                    ui.right_to_left(|ui| {
+                        if ui.small_button("Delete").clicked {
                             delete = Some((e.time, e.text.clone()));
                         }
-                        if ui.small_button("Copy").clicked() {
-                            ctx.output_mut(|o| o.copied_text = e.text.clone());
+                        if ui.small_button("Copy").clicked {
+                            ui.cx.copy = Some(e.text.clone());
                         }
                     });
                 });
-                ui.label(RichText::new(&e.text).color(p.foreground));
+                ui.label(Rt::new(&e.text).color(p.foreground));
             });
             ui.add_space(6.0);
         }
@@ -1754,43 +1965,38 @@ impl App {
 
     // ── Advanced ──────────────────────────────────────────────────────────
 
-    fn advanced_tab(&mut self, ui: &mut egui::Ui) {
+    fn advanced_tab(&mut self, ui: &mut Ui) {
         let p = self.p();
         self.heading(
             ui,
             "Advanced",
             "Microphone, performance and the background service.",
         );
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Microphone");
+        card(ui, |ui| {
+            section_title(ui, "Microphone");
+            let devices = self.devices.lock().map(|d| d.clone()).unwrap_or_default();
             let current = if self.cfg.advanced.microphone.is_empty() {
                 "System default".to_string()
             } else {
-                self.devices
+                devices
                     .iter()
                     .find(|d| d.name == self.cfg.advanced.microphone)
                     .map(|d| d.description.clone())
                     .unwrap_or_else(|| self.cfg.advanced.microphone.clone())
             };
-            egui::ComboBox::from_id_salt("mic")
-                .width(380.0)
-                .selected_text(current)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.cfg.advanced.microphone,
-                        String::new(),
-                        "System default",
-                    );
-                    for d in &self.devices {
-                        ui.selectable_value(
-                            &mut self.cfg.advanced.microphone,
-                            d.name.clone(),
-                            &d.description,
-                        );
-                    }
-                });
+            let mut items = vec!["System default".to_string()];
+            items.extend(devices.iter().map(|d| d.description.clone()));
+            ui.horizontal(|ui| {
+                if let Some(i) = ui.combo("mic", &current, Some(380.0), &items) {
+                    self.cfg.advanced.microphone = if i == 0 {
+                        String::new()
+                    } else {
+                        devices[i - 1].name.clone()
+                    };
+                }
+            });
             ui.label(
-                RichText::new(format!(
+                Rt::new(format!(
                     "Recorded with {} only while you dictate.",
                     audio::backend()
                         .map(|b| b.name())
@@ -1801,62 +2007,78 @@ impl App {
             );
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Performance");
-            egui::Grid::new("perf")
-                .num_columns(2)
-                .spacing([18.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label("Threads");
-                    ui.horizontal_wrapped(|ui| {
-                        let auto = hardware::threads_for(&self.hw);
-                        let mut is_auto = self.cfg.advanced.threads == 0;
-                        if ui
-                            .checkbox(&mut is_auto, format!("Automatic ({auto})"))
-                            .changed()
-                        {
-                            self.cfg.advanced.threads = if is_auto { 0 } else { auto };
-                        }
-                        if !is_auto {
-                            ui.add(egui::Slider::new(
-                                &mut self.cfg.advanced.threads,
-                                1..=self.hw.logical.max(1),
-                            ));
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Priority");
-                    ui.add(egui::Slider::new(&mut self.cfg.advanced.nice, 0..=19).text("nice"))
-                        .on_hover_text(
-                            "Higher values let music, visualizers and the desktop go first",
-                        );
-                    ui.end_row();
-                    ui.label("Model memory");
-                    ui.vertical(|ui| {
-                        ui.checkbox(
-                            &mut self.cfg.advanced.keep_model_loaded,
-                            "Keep the model loaded (faster first dictation)",
-                        );
-                        if !self.cfg.advanced.keep_model_loaded {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Unload after");
-                                ui.add(
-                                    egui::DragValue::new(
-                                        &mut self.cfg.advanced.unload_after_minutes,
-                                    )
-                                    .range(1..=1440)
-                                    .suffix(" min"),
-                                );
-                                ui.label("without dictation");
-                            });
-                        }
-                    });
-                    ui.end_row();
+        card(ui, |ui| {
+            section_title(ui, "Performance");
+            let col = col(ui, &["Threads", "Priority", "Model memory"]);
+            grid_row(ui, col, "Threads", |ui| {
+                let auto = hardware::threads_for(&self.hw);
+                let mut is_auto = self.cfg.advanced.threads == 0;
+                if ui
+                    .checkbox(&mut is_auto, &format!("Automatic ({auto})"))
+                    .changed
+                {
+                    self.cfg.advanced.threads = if is_auto { 0 } else { auto };
+                }
+                if !is_auto {
+                    if let Some(v) = ui.slider(
+                        "threads",
+                        self.cfg.advanced.threads as f64,
+                        1.0,
+                        self.hw.logical.max(1) as f64,
+                        1.0,
+                        0,
+                        "",
+                        "",
+                    ) {
+                        self.cfg.advanced.threads = v as u32;
+                    }
+                }
+            });
+            grid_row(ui, col, "Priority", |ui| {
+                if let Some(v) = ui.slider(
+                    "nice",
+                    self.cfg.advanced.nice as f64,
+                    0.0,
+                    19.0,
+                    1.0,
+                    0,
+                    "",
+                    "nice",
+                ) {
+                    self.cfg.advanced.nice = v as i32;
+                }
+                if ui.cx.slider_hovered {
+                    ui.cx.tooltip = Some(
+                        "Higher values let music, visualizers and the desktop go first".into(),
+                    );
+                }
+            });
+            grid_row(ui, col, "Model memory", |ui| {
+                ui.vertical(|ui| {
+                    ui.checkbox(
+                        &mut self.cfg.advanced.keep_model_loaded,
+                        "Keep the model loaded (faster first dictation)",
+                    );
+                    if !self.cfg.advanced.keep_model_loaded {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Unload after");
+                            ui.drag_value(
+                                "unload",
+                                &mut self.cfg.advanced.unload_after_minutes,
+                                1,
+                                1440,
+                                1.0,
+                                " min",
+                            );
+                            ui.label("without dictation");
+                        });
+                    }
                 });
+            });
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Appearance");
+        card(ui, |ui| {
+            section_title(ui, "Appearance");
             let label = |key: &str, themes: &[(String, String)]| match key {
                 "auto" => "Follow NIRUX (or Omarchy)".to_string(),
                 "classic" => "NIRUDICTATE Classic".to_string(),
@@ -1866,28 +2088,19 @@ impl App {
                     .map(|t| t.1.clone())
                     .unwrap_or_else(|| k.to_string()),
             };
-            egui::ComboBox::from_id_salt("theme")
-                .width(300.0)
-                .selected_text(label(&self.cfg.general.theme, &self.themes))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.cfg.general.theme,
-                        "auto".into(),
-                        label("auto", &self.themes),
-                    );
-                    ui.selectable_value(
-                        &mut self.cfg.general.theme,
-                        "classic".into(),
-                        label("classic", &self.themes),
-                    );
-                    for (k, l) in &self.themes {
-                        ui.selectable_value(&mut self.cfg.general.theme, k.clone(), l);
-                    }
-                });
+            let mut keys = vec!["auto".to_string(), "classic".to_string()];
+            keys.extend(self.themes.iter().map(|t| t.0.clone()));
+            let items: Vec<String> = keys.iter().map(|k| label(k, &self.themes)).collect();
+            let current = label(&self.cfg.general.theme, &self.themes);
+            ui.horizontal(|ui| {
+                if let Some(i) = ui.combo("theme", &current, Some(300.0), &items) {
+                    self.cfg.general.theme = keys[i].clone();
+                }
+            });
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Background service");
+        card(ui, |ui| {
+            section_title(ui, "Background service");
             ui.checkbox(
                 &mut self.cfg.general.autostart,
                 "Start with the desktop session",
@@ -1901,12 +2114,12 @@ impl App {
                     ));
                 }
                 None => {
-                    ui.label(RichText::new("Not running").color(p.error));
+                    ui.label(Rt::new("Not running").color(p.error));
                 }
             });
             ui.horizontal_wrapped(|ui| {
                 if status.is_some() {
-                    if ui.button("Restart service").clicked() {
+                    if ui.button("Restart service").clicked {
                         let _ = ipc::send(&Request::Quit, Duration::from_secs(2));
                         thread::sleep(Duration::from_millis(300));
                         match start_service() {
@@ -1915,11 +2128,11 @@ impl App {
                         }
                     }
                     if status.as_ref().and_then(|s| s.loaded.as_ref()).is_some()
-                        && ui.button("Unload model now").clicked()
+                        && ui.button("Unload model now").clicked
                     {
                         let _ = ipc::send(&Request::Unload, Duration::from_secs(2));
                     }
-                } else if ui.button("Start service").clicked() {
+                } else if ui.button("Start service").clicked {
                     match start_service() {
                         Ok(()) => self.toast("Starting the service…", false),
                         Err(e) => self.toast(e, true),
@@ -1928,8 +2141,8 @@ impl App {
             });
         });
         ui.add_space(12.0);
-        card(ui, &p, |ui| {
-            section_title(ui, &p, "Files");
+        card(ui, |ui| {
+            section_title(ui, "Files");
             for (what, path) in [
                 ("Settings", config::config_path()),
                 ("Models", config::models_dir()),
@@ -1937,12 +2150,8 @@ impl App {
                 ("Service log", config::log_path()),
             ] {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(what).color(p.muted));
-                    ui.label(
-                        RichText::new(path.display().to_string())
-                            .monospace()
-                            .size(12.0),
-                    );
+                    ui.label(Rt::new(what).color(p.muted));
+                    ui.label(Rt::new(path.display().to_string()).monospace().size(12.0));
                 });
             }
         });
@@ -1966,18 +2175,21 @@ fn raise_existing() -> bool {
     let (Some(list), Some(active)) = (atom("_NET_CLIENT_LIST"), atom("_NET_ACTIVE_WINDOW")) else {
         return false;
     };
-    let Some(windows) = conn
+    let mut windows = conn
         .get_property(false, root, list, AtomEnum::WINDOW, 0, 4096)
         .ok()
         .and_then(|c| c.reply().ok())
-        .map(|r| {
-            r.value32()
-                .map(|v| v.collect::<Vec<u32>>())
-                .unwrap_or_default()
-        })
-    else {
-        return false;
-    };
+        .and_then(|r| r.value32().map(|v| v.collect::<Vec<u32>>()))
+        .unwrap_or_default();
+    if windows.is_empty() {
+        // No EWMH window manager: the top-level windows.
+        windows = conn
+            .query_tree(root)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|t| t.children)
+            .unwrap_or_default();
+    }
     for w in windows {
         let class = conn
             .get_property(false, w, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 64)
@@ -1987,6 +2199,11 @@ fn raise_existing() -> bool {
             .unwrap_or_default();
         if class.split(|b| *b == 0).any(|s| s == b"nirudictate") {
             let ev = ClientMessageEvent::new(32, w, active, [1u32, 0, 0, 0, 0]);
+            let _ = conn.configure_window(
+                w,
+                &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                    .stack_mode(x11rb::protocol::xproto::StackMode::ABOVE),
+            );
             let _ = conn.send_event(
                 false,
                 root,
@@ -2028,27 +2245,32 @@ pub fn run(tab: Option<&str>) -> Result<(), String> {
         }
         return Err("the settings panel is already open".into());
     }
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("NIRUDICTATE")
-            .with_app_id("nirudictate")
-            .with_inner_size([980.0, 680.0])
-            .with_min_inner_size([760.0, 520.0])
-            .with_icon(widgets::icon()),
-        vsync: true,
-        ..Default::default()
+    let cfg = Config::load_or_default();
+    let prefs = Arc::new(Mutex::new(Preferences {
+        theme: cfg.general.theme.clone(),
+        ..Preferences::default()
+    }));
+    let theme = resolve_theme(&prefs.lock().expect("prefs").clone());
+    let body = {
+        let scale = prefs.lock().map(|p| p.scale).unwrap_or(1.0);
+        (theme.appearance.font_size * scale).clamp(10.0, 32.0)
     };
-    eframe::run_native(
+    let window = gui::open(
         "NIRUDICTATE",
-        options,
-        Box::new(|cc| {
-            let mut app = App::new(cc);
-            app.restyle_pending = true;
-            app.tab = start_tab;
-            Ok(Box::new(app))
-        }),
-    )
-    .map_err(|e| format!("cannot open the window: {e}"))?;
+        (980.0, 680.0),
+        (760.0, 520.0),
+        widgets::icon(),
+        theme.appearance.font_path.as_deref(),
+        theme.palette,
+        body,
+    )?;
+    let mut app = App::new(cfg, prefs, theme, window.waker());
+    app.tab = start_tab;
+    app.last_tab = start_tab;
+    if start_tab != Tab::Overview {
+        app.select(start_tab);
+    }
+    window.run(&mut app)?;
     drop(lock);
     Ok(())
 }
